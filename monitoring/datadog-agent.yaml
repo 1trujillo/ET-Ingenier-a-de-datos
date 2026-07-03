@@ -1,0 +1,29 @@
+api_key: ${DD_API_KEY}
+site: ${DD_SITE}
+hostname: data-platform
+logs_enabled: true
+logs_config:
+  container_collect_all: true
+apm:
+  enabled: true
+  bind_host: 0.0.0.0
+  port: 8126
+dogstatsd:
+  bind_host: 0.0.0.0
+  port: 8125
+  non_local_traffic: true
+use_dogstatsd: true
+otlp_config:
+  receiver:
+    protocols:
+      grpc:
+        enabled: true
+        endpoint: 0.0.0.0:4317
+      http:
+        enabled: true
+        endpoint: 0.0.0.0:4318
+custom_logs:
+  - type: file
+    path: /var/log/containers/*.log
+    service: data-platform
+    source: docker

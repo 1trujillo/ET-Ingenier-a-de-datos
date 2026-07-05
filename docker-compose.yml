@@ -1,0 +1,366 @@
+services:
+  # ============================================
+  # INFRAESTRUCTURA
+  # ============================================
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_INIT_LIMIT: 5
+      ZK_CLIENT_PORT: 2181
+      KAFKA_BROKER_ID: 1
+    ports:
+      - "2181:2181"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_COMPRESSION_TYPE: snappy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: admin123
+      MONGO_INITDB_DATABASE: data_platform
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - ./config/mongo-init.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # DATADOG AGENT
+  # ============================================
+
+  datadog-agent:
+    image: datadog/agent:latest
+    container_name: datadog-agent
+    environment:
+      DD_API_KEY: ${DD_API_KEY:-test_key_local_only}
+      DD_SITE: ${DD_SITE:-datadoghq.com}
+      DD_LOGS_ENABLED: "true"
+      DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL: "true"
+      DD_CONTAINER_EXCLUDE_LOGS: "image:datadog/agent"
+      DD_APM_ENABLED: "true"
+      DD_TRACE_SAMPLE_RATE: 1
+      DD_METRICS_LIMIT: 2000
+      DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"
+      DD_DOGSTATSD_SOCKET: /var/run/datadog/dsd.sock
+    ports:
+      - "8126:8126"
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./monitoring/datadog-agent.yaml:/etc/datadog-agent/datadog.yaml:ro
+      - datadog_socket:/var/run/datadog
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "agent", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # COMPONENTES DE DATOS
+  # ============================================
+
+  generator:
+    build:
+      context: ./generator
+      dockerfile: Dockerfile
+    container_name: data-generator
+    depends_on:
+      kafka:
+        condition: service_healthy
+      datadog-agent:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: raw_events
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: 8126
+      DD_DOGSTATSD_HOST: datadog-agent
+      DD_DOGSTATSD_PORT: 8125
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
+      OTEL_ENVIRONMENT: local
+      PYTHONUNBUFFERED: 1
+    networks:
+      - data-platform
+    volumes:
+      - datadog_socket:/var/run/datadog
+    restart: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  streaming-worker:
+    build:
+      context: ./streaming_worker
+      dockerfile: Dockerfile
+    container_name: streaming-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      datadog-agent:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: raw_events
+      KAFKA_GROUP_ID: bronze_workers
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: bronze
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: 8126
+      DD_DOGSTATSD_HOST: datadog-agent
+      DD_DOGSTATSD_PORT: 8125
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
+      OTEL_ENVIRONMENT: local
+      PYTHONUNBUFFERED: 1
+    networks:
+      - data-platform
+    volumes:
+      - datadog_socket:/var/run/datadog
+    restart: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  etl-spark:
+    build:
+      context: ./etl
+      dockerfile: Dockerfile
+    container_name: etl-spark
+    depends_on:
+      minio:
+        condition: service_healthy
+      datadog-agent:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET_BRONZE: bronze
+      MINIO_BUCKET_SILVER: silver
+      SPARK_LOCAL_IP: etl-spark
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: 8126
+      DD_DOGSTATSD_HOST: datadog-agent
+      DD_DOGSTATSD_PORT: 8125
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
+      OTEL_ENVIRONMENT: local
+      PYTHONUNBUFFERED: 1
+    networks:
+      - data-platform
+    volumes:
+      - datadog_socket:/var/run/datadog
+    restart: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  gold-transformer:
+    build:
+      context: ./etl
+      dockerfile: Dockerfile.gold
+    container_name: gold-transformer
+    depends_on:
+      minio:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      datadog-agent:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET_SILVER: silver
+      MONGODB_URI: mongodb://admin:admin123@mongodb:27017/data_platform?authSource=admin
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: 8126
+      DD_DOGSTATSD_HOST: datadog-agent
+      DD_DOGSTATSD_PORT: 8125
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
+      OTEL_ENVIRONMENT: local
+      PYTHONUNBUFFERED: 1
+    networks:
+      - data-platform
+    volumes:
+      - datadog_socket:/var/run/datadog
+    restart: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # API Y APLICACIONES
+  # ============================================
+
+  fastapi:
+    build:
+      context: ./fastapi_service
+      dockerfile: Dockerfile
+    container_name: fastapi-server
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      datadog-agent:
+        condition: service_healthy
+    environment:
+      MONGODB_URI: mongodb://admin:admin123@mongodb:27017/data_platform?authSource=admin
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: 8126
+      DD_DOGSTATSD_HOST: datadog-agent
+      DD_DOGSTATSD_PORT: 8125
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
+      OTEL_ENVIRONMENT: local
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "8000:8000"
+    networks:
+      - data-platform
+    volumes:
+      - datadog_socket:/var/run/datadog
+    restart: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # MONITOREO Y LOGGING
+  # ============================================
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./monitoring/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - fastapi
+      - minio
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  data-platform:
+    driver: bridge
+
+volumes:
+  minio_data:
+  mongodb_data:
+  datadog_socket:

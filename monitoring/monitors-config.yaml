@@ -1,0 +1,133 @@
+# Datadog Monitors Configuration
+# Este archivo documenta los monitors que deben ser creados en Datadog
+
+monitors:
+  - name: "High CPU Usage"
+    type: metric_alert
+    query: "avg:system.cpu.user{service:data-platform} > 0.80"
+    threshold: 0.80
+    alert_message: "CPU usage is above 80% on {{host.name}}"
+
+  - name: "High Memory Usage"
+    type: metric_alert
+    query: "avg:system.mem.pct_usable{service:data-platform} < 0.20"
+    threshold: 20
+    alert_message: "Memory usage is above 80% on {{host.name}}"
+
+  - name: "Kafka Consumer Lag High"
+    type: metric_alert
+    query: "avg:kafka.consumer.lag{service:streaming_worker} > 1000"
+    threshold: 1000
+    alert_message: "Kafka consumer lag is high: {{value}}"
+
+  - name: "ETL Failure"
+    type: metric_alert
+    query: "avg:etl_spark.etl_runs{status:failed} > 0"
+    alert_message: "ETL pipeline failed"
+
+  - name: "FastAPI High Latency"
+    type: metric_alert
+    query: "avg:fastapi.request_duration_ms{} > 500"
+    threshold: 500
+    alert_message: "FastAPI response time is above 500ms"
+
+  - name: "Container Down"
+    type: service_check
+    query: "service_check('docker.container.up').last(4).count_by_status()"
+    alert_message: "Container is down"
+
+  - name: "MongoDB Connection Errors"
+    type: metric_alert
+    query: "sum:gold_transformer.mongodb_connection_attempts{} > 2"
+    alert_message: "Multiple MongoDB connection failures detected"
+
+dashboards:
+  - name: "Pipeline Health"
+    description: "Overall pipeline health and performance metrics"
+    widgets:
+      - title: "Generator Events Produced"
+        type: timeseries
+        query: "sum:generator.events_produced{}"
+      
+      - title: "Streaming Worker Consumption"
+        type: timeseries
+        query: "sum:streaming_worker.messages_consumed{}"
+      
+      - title: "ETL Processing Duration"
+        type: timeseries
+        query: "avg:etl_spark.etl_duration_seconds{}"
+      
+      - title: "Gold Documents Created"
+        type: timeseries
+        query: "sum:gold_transformer.documents_created{}"
+
+  - name: "Kafka Metrics"
+    description: "Kafka producer and consumer metrics"
+    widgets:
+      - title: "Events Produced Rate"
+        type: timeseries
+        query: "sum:generator.events.produced{}.as_count()"
+      
+      - title: "Consumer Lag"
+        type: timeseries
+        query: "avg:streaming_worker.consumer_lag{}"
+      
+      - title: "Batch Latency"
+        type: histogram
+        query: "avg:streaming_worker.batch.latency_ms{}"
+
+  - name: "MongoDB Metrics"
+    description: "MongoDB performance and health"
+    widgets:
+      - title: "Insert Latency"
+        type: timeseries
+        query: "avg:gold_transformer.mongodb.insert_latency_ms{}"
+      
+      - title: "Documents Stored"
+        type: timeseries
+        query: "sum:gold_transformer.documents.inserted{}"
+
+  - name: "FastAPI Metrics"
+    description: "API performance metrics"
+    widgets:
+      - title: "Request Rate"
+        type: timeseries
+        query: "sum:fastapi.requests_total{}.as_count()"
+      
+      - title: "Request Duration"
+        type: timeseries
+        query: "avg:fastapi.request_duration_ms{}"
+      
+      - title: "API Endpoints Performance"
+        type: table
+        query: "avg:fastapi.endpoint.*_duration_ms{} by {endpoint}"
+
+  - name: "System Metrics"
+    description: "Docker and system resource metrics"
+    widgets:
+      - title: "CPU Usage by Container"
+        type: timeseries
+        query: "avg:docker.cpu.percentage{} by {container_name}"
+      
+      - title: "Memory Usage by Container"
+        type: timeseries
+        query: "avg:docker.mem.usage{} by {container_name}"
+      
+      - title: "Disk I/O"
+        type: timeseries
+        query: "avg:system.io.reads{}, avg:system.io.writes{}"
+
+  - name: "ETL Pipeline Metrics"
+    description: "ETL processing and data quality"
+    widgets:
+      - title: "Records Processed"
+        type: timeseries
+        query: "sum:etl_spark.records_processed{}"
+      
+      - title: "Invalid Records"
+        type: timeseries
+        query: "sum:etl_spark.records_invalid{}"
+      
+      - title: "Silver Data Size"
+        type: gauge
+        query: "avg:minio.bucket.size{bucket:silver}"

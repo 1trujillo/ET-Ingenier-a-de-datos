@@ -33,6 +33,16 @@ def configure_observability(
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://datadog-agent:4318")
     endpoint = endpoint.rstrip("/")
 
+    # Control whether to send logs via OTLP. Many local Datadog agent
+    # installations don't expose an OTLP logs HTTP endpoint, so keep
+    # this disabled by default and rely on the Datadog agent's
+    # container log collection instead.
+    send_logs = os.getenv("OTEL_EXPORTER_OTLP_SEND_LOGS", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
     resource = Resource.create(
         {
             "service.name": service_name,
@@ -55,17 +65,19 @@ def configure_observability(
     )
     trace.set_tracer_provider(tracer_provider)
 
-    logger_provider = LoggerProvider(resource=resource)
-    logger_provider.add_log_record_processor(
-        BatchLogRecordProcessor(
-            _build_otlp_exporter(OTLPLogExporter, f"{endpoint}/v1/logs")
+    logger_provider = None
+    if send_logs:
+        logger_provider = LoggerProvider(resource=resource)
+        logger_provider.add_log_record_processor(
+            BatchLogRecordProcessor(
+                _build_otlp_exporter(OTLPLogExporter, f"{endpoint}/v1/logs")
+            )
         )
-    )
-    set_logger_provider(logger_provider)
+        set_logger_provider(logger_provider)
 
-    root_logger = logging.getLogger()
-    root_logger.setLevel(log_level)
-    root_logger.addHandler(LoggingHandler(level=log_level, logger_provider=logger_provider))
+        root_logger = logging.getLogger()
+        root_logger.setLevel(log_level)
+        root_logger.addHandler(LoggingHandler(level=log_level, logger_provider=logger_provider))
 
     meter = metrics.get_meter(service_name)
     tracer = trace.get_tracer(service_name)

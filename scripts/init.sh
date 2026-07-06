@@ -33,7 +33,7 @@ echo -e "${GREEN}✓ Docker Compose OK${NC}"
 
 # Crear directorios necesarios
 echo -e "${YELLOW}[3/5] Creando directorios...${NC}"
-mkdir -p data/{bronze,silver,gold,mongodb,minio}
+mkdir -p data/{bronze,silver,gold,minio}
 echo -e "${GREEN}✓ Directorios creados${NC}"
 
 # Configurar variables de entorno
@@ -52,8 +52,10 @@ MINIO_ENDPOINT=minio:9000
 MINIO_ACCESS_KEY=minioadmin
 MINIO_SECRET_KEY=minioadmin
 
-# MongoDB
-MONGODB_URI=mongodb://admin:admin123@mongodb:27017/data_platform?authSource=admin
+# Gold (MinIO buckets)
+MINIO_BUCKET_BRONZE=bronze
+MINIO_BUCKET_SILVER=silver
+MINIO_BUCKET_GOLD=gold
 EOF
     echo -e "${GREEN}✓ Archivo .env creado${NC}"
 else
@@ -74,13 +76,15 @@ echo "  - Zookeeper: localhost:2181"
 echo "  - Kafka: localhost:9092"
 echo "  - MinIO: http://localhost:9000"
 echo "  - MinIO Console: http://localhost:9001"
-echo "  - MongoDB: mongodb://localhost:27017"
 echo "  - FastAPI Docs: http://localhost/docs"
 echo "  - Datadog Agent: localhost:8126"
 echo ""
-echo "Credenciales:"
-echo "  - MinIO: minioadmin / minioadmin"
-echo "  - MongoDB: admin / admin123"
+echo "Capas de datos (todo en MinIO):"
+echo "  - Bronze: eventos crudos desde Kafka"
+echo "  - Silver: datos limpios y enriquecidos (Parquet)"
+echo "  - Gold: métricas agregadas e incidentes (JSON)"
+echo ""
+echo "Credenciales MinIO: minioadmin / minioadmin"
 echo ""
 echo "Próximos pasos:"
 echo "  1. Verificar servicios: docker compose ps"

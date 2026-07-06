@@ -35,7 +35,7 @@ Kafka Topic "raw_events"
     ↓ (Consumer Group: bronze_workers)
 Streaming Worker
     ↓ (Batch)
-MinIO S3
+MinIO S3 (bronze)
 ```
 
 ## 2. Silver Layer (Cleansed & Enriched)
@@ -130,21 +130,31 @@ StructType([
 Datos ya procesados, listos para consultas y análisis.
 
 ### Características
-- **Procesamiento**: Agregaciones y transformaciones
-- **Almacenamiento**: MongoDB
-- **Formato**: BSON (documentos)
+- **Procesamiento**: Agregaciones y transformaciones (Gold Transformer)
+- **Almacenamiento**: MinIO (S3-compatible)
+- **Formato**: JSON
 - **Intervalo de actualización**: 10 minutos
 - **Acceso**: REST API con FastAPI
+
+### Estructura en MinIO
+```
+s3://gold/
+├── hourly_metrics/
+│   └── date=2024-01-15/
+│       └── 1705330245000.json
+└── incident_reports/
+    └── date=2024-01-15/
+        └── 1705330245001.json
+```
 
 ### Entidades
 
 #### Hourly Metrics
 Agregados por hora de cada tipo de sensor.
 
-```javascript
+```json
 {
-  "_id": ObjectId(),
-  "timestamp": ISODate("2024-01-15T10:00:00Z"),
+  "timestamp": "2024-01-15T10:00:00",
   "year": 2024,
   "month": 1,
   "day": 15,
@@ -165,10 +175,9 @@ Agregados por hora de cada tipo de sensor.
 #### Incident Reports
 Reportes de incidentes detectados.
 
-```javascript
+```json
 {
-  "_id": ObjectId(),
-  "timestamp": ISODate("2024-01-15T10:15:30Z"),
+  "timestamp": "2024-01-15T10:15:30",
   "sensor_id": "SENSOR_0042",
   "sensor_type": "traffic",
   "incident_type": "accident",
@@ -178,19 +187,6 @@ Reportes de incidentes detectados.
   },
   "intersection": "INT_0042"
 }
-```
-
-### Índices
-
-```javascript
-// Hourly Metrics
-db.hourly_metrics.createIndex({ "timestamp": -1 });
-db.hourly_metrics.createIndex({ "sensor_type": 1, "timestamp": -1 });
-
-// Incident Reports
-db.incident_reports.createIndex({ "timestamp": -1 });
-db.incident_reports.createIndex({ "incident_type": 1, "timestamp": -1 });
-db.incident_reports.createIndex({ "location": "2dsphere" });
 ```
 
 ## Componentes de Sistema
@@ -245,8 +241,8 @@ db.incident_reports.createIndex({ "location": "2dsphere" });
 - Execution Mode: local
 
 **Procesamiento**:
-- Input: MinIO (Parquet)
-- Output: MinIO (Parquet)
+- Input: MinIO Bronze (JSON)
+- Output: MinIO Silver (Parquet)
 - Intervalo: 5 minutos
 
 **Optimizaciones**:
@@ -263,6 +259,8 @@ db.incident_reports.createIndex({ "location": "2dsphere" });
 - Detección de incidentes
 - Estadísticas de locación
 
+**Almacenamiento**: MinIO Gold (JSON)
+**Formato**: JSON particionado por fecha
 **Intervalo**: 10 minutos
 
 ### 6. FastAPI
@@ -274,6 +272,8 @@ db.incident_reports.createIndex({ "location": "2dsphere" });
 - GET /api/v1/incidents - Reportes de incidentes
 - GET /api/v1/aggregations/by-sensor-type - Agregaciones
 - GET /api/v1/stats/database - Estadísticas
+
+**Almacenamiento**: Lee desde MinIO Gold layer (S3 API)
 
 **Rate Limiting**: No implementado (MVP)
 
@@ -307,7 +307,7 @@ Spark Local
 MinIO Silver (Parquet)
 ```
 
-### Agregación
+### Agregación (Gold)
 
 ```
 MinIO Silver (cada 10 min)
@@ -316,17 +316,17 @@ Gold Transformer
   - Agregación por hora
   - Detección de incidentes
   ↓
-MongoDB Gold
-  - hourly_metrics
-  - incident_reports
+MinIO Gold (JSON)
+  - hourly_metrics/
+  - incident_reports/
 ```
 
 ### Exposición
 
 ```
-MongoDB Gold
+MinIO Gold (S3 API)
   ↓
-FastAPI
+FastAPI (boto3 S3 client)
   ↓ JSON REST API
 Nginx Proxy
   ↓
@@ -357,7 +357,7 @@ Consumidores (Datadog, Dashboards, etc)
 4. **Gold Transformer**
    - Transformation runs
    - Documents created
-   - MongoDB I/O metrics
+   - MinIO I/O metrics
 
 5. **FastAPI**
    - Requests total
@@ -377,9 +377,10 @@ Consumidores (Datadog, Dashboards, etc)
 1. **Medallion Architecture**: Separación clara de capas
 2. **Local Deployment**: Facilita desarrollo y testing
 3. **Parquet en Silver**: Compresión y velocidad
-4. **MongoDB en Gold**: Flexibilidad de esquema
-5. **OpenTelemetry + DogStatsD**: Estándar abierto + Datadog
-6. **Spark Local**: Suficiente para MVP, scalable a cluster
+4. **MinIO para todas las capas (Bronze, Silver, Gold)**: Simplifica la infraestructura, eliminando MongoDB
+5. **JSON en Gold**: Formato portable y legible para la API
+6. **OpenTelemetry + DogStatsD**: Estándar abierto + Datadog
+7. **Spark Local**: Suficiente para MVP, scalable a cluster
 
 ## Consideraciones de Escala
 
@@ -387,17 +388,15 @@ Consumidores (Datadog, Dashboards, etc)
 
 1. **Kafka Single Broker**: Limita throughput
 2. **Spark Local**: Limita procesamiento
-3. **Single MongoDB**: Limita queries
-4. **MinIO Single Node**: Sin replicación
+3. **MinIO Single Node**: Sin replicación
 
 ### Mejoras Futuras
 
 1. Kafka Multi-broker cluster
 2. Spark Cluster mode (YARN/K8s)
-3. MongoDB Replica Set
-4. MinIO Distributed mode
-5. Caching layer (Redis)
-6. Database indexing optimization
+3. MinIO Distributed mode
+4. Caching layer (Redis)
+5. Data Lake indexing optimization
 
 ## Seguridad
 
@@ -413,4 +412,4 @@ Consumidores (Datadog, Dashboards, etc)
 - Encriptación TLS
 - Network segmentation
 - Audit logging
-- RBAC en MongoDB
+- Bucket policies en MinIO

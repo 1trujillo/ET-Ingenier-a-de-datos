@@ -16,7 +16,6 @@ docker compose down
 echo "Eliminando volúmenes..."
 docker volume rm \
     et-ingenier-a-de-datos_minio_data \
-    et-ingenier-a-de-datos_mongodb_data \
     et-ingenier-a-de-datos_datadog_socket || true
 
 echo "Eliminando directorios de datos..."

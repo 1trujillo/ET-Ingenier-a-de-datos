@@ -112,7 +112,8 @@ class SparkETL:
     def __init__(self):
         self.spark = self._create_spark_session()
         self.s3_client = self._create_s3_client()
-
+        self._ensure_bucket_exists(MINIO_BUCKET_BRONZE)
+        self._ensure_bucket_exists(MINIO_BUCKET_SILVER)
     def _create_spark_session(self) -> SparkSession:
         """Crear Spark session"""
         return SparkSession.builder \
@@ -149,8 +150,17 @@ class SparkETL:
         """Cargar datos de Bronze"""
         try:
             with tracer.start_as_current_span("load_bronze"):
+                # 1. Verificar primero con boto3 si hay archivos JSON en bronze/raw/
+                response = self.s3_client.list_objects_v2(
+                    Bucket=MINIO_BUCKET_BRONZE,
+                    Prefix="raw/"
+                )
+                if 'Contents' not in response or not any(obj['Key'].endswith('.json') for obj in response['Contents']):
+                    logger.warning("Aún no hay archivos JSON en la capa Bronze.")
+                    return None
+
+                # 2. Leer con Spark solo cuando confirmamos que existen datos
                 bronze_path = f"s3a://{MINIO_BUCKET_BRONZE}/raw/"
-                
                 df = self.spark.read.json(bronze_path)
                 
                 if df.count() == 0:
@@ -163,7 +173,7 @@ class SparkETL:
         except Exception as e:
             logger.error(f"Error loading Bronze data: {str(e)}")
             return None
-
+        
     def validate_and_clean(self, df):
         """Validar y limpiar datos"""
         with tracer.start_as_current_span("validate_and_clean"):
@@ -286,7 +296,7 @@ class SparkETL:
 # ============================================
 
 def run_etl_scheduler():
-    """Ejecutar ETL cada 5 minutos"""
+    """Ejecutar ETL cada 60 segundos para pruebas locales (en prod: 300)"""
     etl = SparkETL()
     
     while True:
@@ -295,7 +305,7 @@ def run_etl_scheduler():
         except Exception as e:
             logger.error(f"Error in ETL scheduler: {str(e)}")
         
-        time.sleep(300)  # 5 minutos
+        time.sleep(60)  # <- Cambiar de 300 a 60 segundos
 
 # ============================================
 # MAIN

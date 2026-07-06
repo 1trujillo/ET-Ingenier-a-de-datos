@@ -5,9 +5,8 @@ import time
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
+import boto3
 from fastapi import FastAPI, Query, HTTPException
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
 from pydantic import BaseModel
 from opentelemetry import metrics, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -89,7 +88,10 @@ request_duration = meter.create_histogram(
 # CONFIGURACIÓN
 # ============================================
 
-MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://admin:admin123@mongodb:27017/data_platform?authSource=admin')
+MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', 'minio:9000')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+MINIO_BUCKET_GOLD = os.getenv('MINIO_BUCKET_GOLD', 'gold')
 
 # ============================================
 # MODELOS
@@ -133,38 +135,57 @@ class IncidentReport(BaseModel):
     intersection: str
 
 # ============================================
-# CLIENTE MONGODB
+# CLIENTE MINIO (Gold Layer)
 # ============================================
 
-class MongoDBConnection:
+class MinIOClient:
     def __init__(self):
-        self.client = None
-        self.db = None
-        self._connect()
+        self.s3_client = boto3.client(
+            's3',
+            endpoint_url=f'http://{MINIO_ENDPOINT}',
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            region_name='us-east-1'
+        )
+        self.bucket = MINIO_BUCKET_GOLD
 
-    def _connect(self):
-        """Conectar a MongoDB"""
-        retry_count = 0
-        max_retries = 5
-        
-        while retry_count < max_retries:
-            try:
-                self.client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-                self.client.admin.command('ping')
-                self.db = self.client['data_platform']
-                logger.info("Connected to MongoDB")
-                return True
-            except Exception as e:
-                retry_count += 1
-                logger.warning(f"MongoDB connection attempt {retry_count}/{max_retries} failed: {str(e)}")
-                if retry_count < max_retries:
-                    time.sleep(2)
-                else:
-                    raise
+    def read_all_json(self, prefix: str) -> List[Dict]:
+        """Leer todos los archivos JSON de un prefijo en MinIO"""
+        try:
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.bucket,
+                Prefix=prefix
+            )
 
-    def close(self):
-        if self.client:
-            self.client.close()
+            if 'Contents' not in response:
+                return []
+
+            all_records = []
+            for obj in response['Contents']:
+                if not obj['Key'].endswith('.json'):
+                    continue
+                obj_response = self.s3_client.get_object(
+                    Bucket=self.bucket,
+                    Key=obj['Key']
+                )
+                content = json.loads(obj_response['Body'].read().decode('utf-8'))
+                if isinstance(content, list):
+                    all_records.extend(content)
+                elif isinstance(content, dict):
+                    all_records.append(content)
+
+            return all_records
+        except Exception as e:
+            logger.error(f"Error reading from MinIO: {str(e)}")
+            return []
+
+    def health_check(self) -> bool:
+        """Verificar conectividad con MinIO"""
+        try:
+            self.s3_client.head_bucket(Bucket=self.bucket)
+            return True
+        except Exception:
+            return False
 
 # ============================================
 # FASTAPI APP
@@ -172,33 +193,31 @@ class MongoDBConnection:
 
 app = FastAPI(
     title="Data Platform API",
-    description="Gold Layer API - Read-only access to processed data",
-    version="1.0.0"
+    description="Gold Layer API - Read-only access to processed data from MinIO",
+    version="2.0.0"
 )
 
-# Variable global para la conexión
-db_connection: Optional[MongoDBConnection] = None
+# Variable global para el cliente MinIO
+minio_client: Optional[MinIOClient] = None
 
 FastAPIInstrumentor.instrument_app(app)
 
 @app.on_event("startup")
 async def startup_event():
-    """Inicializar conexión a MongoDB"""
-    global db_connection
+    """Inicializar conexión a MinIO"""
+    global minio_client
     try:
-        db_connection = MongoDBConnection()
-        logger.info("API started successfully")
+        minio_client = MinIOClient()
+        logger.info("API started successfully - connected to MinIO gold layer")
     except Exception as e:
-        logger.error(f"Failed to initialize MongoDB connection: {str(e)}")
+        logger.error(f"Failed to initialize MinIO client: {str(e)}")
         raise
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cerrar conexión a MongoDB"""
-    global db_connection
-    if db_connection:
-        db_connection.close()
-        logger.info("API shutdown successfully")
+    """Cerrar cliente (sin efecto real para S3, pero mantenemos la estructura)"""
+    global minio_client
+    logger.info("API shutdown successfully")
 
 # ============================================
 # HEALTH CHECK
@@ -208,16 +227,17 @@ async def shutdown_event():
 async def health_check():
     """Health check endpoint"""
     start_time = time.time()
-    
+
     try:
         with tracer.start_as_current_span("health_check"):
             requests_total.add(1)
-            
-            db_connection.client.admin.command('ping')
-            
+
+            if not minio_client.health_check():
+                raise HTTPException(status_code=503, detail="MinIO not available")
+
             elapsed = (time.time() - start_time) * 1000
             request_duration.record(elapsed)
-            
+
             return {
                 "status": "healthy",
                 "timestamp": datetime.utcnow().isoformat(),
@@ -231,8 +251,9 @@ async def health_check():
 async def readiness_check():
     """Readiness check endpoint"""
     try:
-        db_connection.client.admin.command('ping')
-        return {"status": "ready"}
+        if minio_client.health_check():
+            return {"status": "ready"}
+        raise Exception("MinIO not ready")
     except Exception:
         raise HTTPException(status_code=503, detail="Not ready")
 
@@ -246,33 +267,39 @@ async def get_hourly_metrics(
     hours: int = Query(24, ge=1, le=720),
     limit: int = Query(1000, ge=1, le=10000)
 ):
-    """Obtener métricas por hora"""
+    """Obtener métricas por hora desde MinIO Gold"""
     start_time = time.time()
-    
+
     try:
         with tracer.start_as_current_span("get_hourly_metrics"):
             requests_total.add(1)
-            
-            collection = db_connection.db['hourly_metrics']
-            
-            query = {}
+
+            # Leer todos los datos de hourly_metrics desde MinIO
+            all_records = minio_client.read_all_json("hourly_metrics/")
+
+            # Filtrar por tipo de sensor
             if sensor_type:
-                query['sensor_type'] = sensor_type.lower()
-            
-            # Últimas N horas
+                all_records = [r for r in all_records if r.get('sensor_type', '').lower() == sensor_type.lower()]
+
+            # Filtrar por las últimas N horas
             since = datetime.utcnow() - timedelta(hours=hours)
-            query['timestamp'] = {'$gte': since}
-            
-            results = list(collection.find(query).limit(limit).sort('timestamp', -1))
-            
-            # Convertir ObjectId a string
-            for doc in results:
-                doc.pop('_id', None)
-            
+            filtered = []
+            for r in all_records:
+                try:
+                    ts = datetime.fromisoformat(r['timestamp'])
+                    if ts >= since:
+                        filtered.append(r)
+                except (KeyError, ValueError):
+                    continue
+
+            # Ordenar por timestamp descendente y limitar
+            filtered.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            results = filtered[:limit]
+
             elapsed = (time.time() - start_time) * 1000
             request_duration.record(elapsed)
             statsd_client.histogram('endpoint.hourly_metrics.duration_ms', elapsed)
-            
+
             return results
     except Exception as e:
         logger.error(f"Error fetching hourly metrics: {str(e)}")
@@ -288,35 +315,39 @@ async def get_incidents(
     hours: int = Query(24, ge=1, le=720),
     limit: int = Query(1000, ge=1, le=10000)
 ):
-    """Obtener reportes de incidentes"""
+    """Obtener reportes de incidentes desde MinIO Gold"""
     start_time = time.time()
-    
+
     try:
         with tracer.start_as_current_span("get_incidents"):
             requests_total.add(1)
-            
-            collection = db_connection.db['incident_reports']
-            
-            query = {}
+
+            # Leer todos los datos de incident_reports desde MinIO
+            all_records = minio_client.read_all_json("incident_reports/")
+
+            # Filtrar por tipo de incidente
             if incident_type:
-                query['incident_type'] = incident_type.lower()
-            
-            # Últimas N horas
+                all_records = [r for r in all_records if r.get('incident_type', '').lower() == incident_type.lower()]
+
+            # Filtrar por las últimas N horas
             since = datetime.utcnow() - timedelta(hours=hours)
-            if 'timestamp' in query:
-                query['timestamp'] = {'$gte': since}
-            else:
-                query['timestamp'] = {'$gte': since}
-            
-            results = list(collection.find(query).limit(limit).sort('timestamp', -1))
-            
-            for doc in results:
-                doc.pop('_id', None)
-            
+            filtered = []
+            for r in all_records:
+                try:
+                    ts = datetime.fromisoformat(r['timestamp'])
+                    if ts >= since:
+                        filtered.append(r)
+                except (KeyError, ValueError):
+                    continue
+
+            # Ordenar por timestamp descendente y limitar
+            filtered.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            results = filtered[:limit]
+
             elapsed = (time.time() - start_time) * 1000
             request_duration.record(elapsed)
             statsd_client.histogram('endpoint.incidents.duration_ms', elapsed)
-            
+
             return results
     except Exception as e:
         logger.error(f"Error fetching incidents: {str(e)}")
@@ -328,43 +359,55 @@ async def get_incidents(
 
 @app.get("/api/v1/aggregations/by-sensor-type")
 async def get_aggregations_by_sensor_type(hours: int = Query(24, ge=1, le=720)):
-    """Obtener agregaciones por tipo de sensor"""
+    """Obtener agregaciones por tipo de sensor desde MinIO Gold"""
     start_time = time.time()
-    
+
     try:
         with tracer.start_as_current_span("get_aggregations"):
             requests_total.add(1)
-            
-            collection = db_connection.db['hourly_metrics']
-            
-            pipeline = [
-                {
-                    '$match': {
-                        'timestamp': {'$gte': datetime.utcnow() - timedelta(hours=hours)}
-                    }
-                },
-                {
-                    '$group': {
-                        '_id': '$sensor_type',
-                        'avg_records': {'$avg': '$record_count'},
-                        'total_records': {'$sum': '$record_count'},
-                        'count': {'$sum': 1}
-                    }
-                },
-                {
-                    '$sort': {'total_records': -1}
-                }
-            ]
-            
-            results = list(collection.aggregate(pipeline))
-            
-            for doc in results:
-                doc.pop('_id', None)
-            
+
+            # Leer todos los datos de hourly_metrics
+            all_records = minio_client.read_all_json("hourly_metrics/")
+
+            # Filtrar por las últimas N horas
+            since = datetime.utcnow() - timedelta(hours=hours)
+            filtered = []
+            for r in all_records:
+                try:
+                    ts = datetime.fromisoformat(r['timestamp'])
+                    if ts >= since:
+                        filtered.append(r)
+                except (KeyError, ValueError):
+                    continue
+
+            # Agrupar por tipo de sensor
+            groups: Dict[str, List[Dict]] = {}
+            for r in filtered:
+                st = r.get('sensor_type', 'unknown')
+                if st not in groups:
+                    groups[st] = []
+                groups[st].append(r)
+
+            # Calcular agregaciones
+            aggregations = []
+            for sensor_type, records in groups.items():
+                total_records = sum(r.get('record_count', 0) for r in records)
+                avg_records = total_records / len(records) if records else 0
+
+                aggregations.append({
+                    'sensor_type': sensor_type,
+                    'avg_records': round(avg_records, 2),
+                    'total_records': total_records,
+                    'count': len(records)
+                })
+
+            # Ordenar por total_records descendente
+            aggregations.sort(key=lambda x: x['total_records'], reverse=True)
+
             elapsed = (time.time() - start_time) * 1000
             request_duration.record(elapsed)
-            
-            return {'aggregations': results}
+
+            return {'aggregations': aggregations}
     except Exception as e:
         logger.error(f"Error fetching aggregations: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -375,22 +418,26 @@ async def get_aggregations_by_sensor_type(hours: int = Query(24, ge=1, le=720)):
 
 @app.get("/api/v1/stats/database")
 async def get_database_stats():
-    """Obtener estadísticas de la base de datos"""
+    """Obtener estadísticas de la base de datos (Gold layer en MinIO)"""
     start_time = time.time()
-    
+
     try:
         with tracer.start_as_current_span("get_db_stats"):
             requests_total.add(1)
-            
+
+            hourly_metrics = minio_client.read_all_json("hourly_metrics/")
+            incidents = minio_client.read_all_json("incident_reports/")
+
             stats = {
-                'hourly_metrics_count': db_connection.db['hourly_metrics'].count_documents({}),
-                'incidents_count': db_connection.db['incident_reports'].count_documents({}),
-                'timestamp': datetime.utcnow().isoformat()
+                'hourly_metrics_count': len(hourly_metrics),
+                'incidents_count': len(incidents),
+                'timestamp': datetime.utcnow().isoformat(),
+                'storage': 'minio_gold'
             }
-            
+
             elapsed = (time.time() - start_time) * 1000
             request_duration.record(elapsed)
-            
+
             return stats
     except Exception as e:
         logger.error(f"Error fetching database stats: {str(e)}")

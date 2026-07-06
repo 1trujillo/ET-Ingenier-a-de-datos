@@ -84,31 +84,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  mongodb:
-    image: mongo:7.0
-    container_name: mongodb
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: admin
-      MONGO_INITDB_ROOT_PASSWORD: admin123
-      MONGO_INITDB_DATABASE: data_platform
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongodb_data:/data/db
-      - ./config/mongo-init.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
-    networks:
-      - data-platform
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
   # ============================================
   # DATADOG AGENT
   # ============================================
@@ -264,8 +239,6 @@ services:
     depends_on:
       minio:
         condition: service_healthy
-      mongodb:
-        condition: service_healthy
       datadog-agent:
         condition: service_healthy
     environment:
@@ -273,7 +246,7 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET_SILVER: silver
-      MONGODB_URI: mongodb://admin:admin123@mongodb:27017/data_platform?authSource=admin
+      MINIO_BUCKET_GOLD: gold
       DD_AGENT_HOST: datadog-agent
       DD_TRACE_AGENT_PORT: 8126
       DD_DOGSTATSD_HOST: datadog-agent
@@ -302,12 +275,15 @@ services:
       dockerfile: Dockerfile
     container_name: fastapi-server
     depends_on:
-      mongodb:
+      minio:
         condition: service_healthy
       datadog-agent:
         condition: service_healthy
     environment:
-      MONGODB_URI: mongodb://admin:admin123@mongodb:27017/data_platform?authSource=admin
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET_GOLD: gold
       DD_AGENT_HOST: datadog-agent
       DD_TRACE_AGENT_PORT: 8126
       DD_DOGSTATSD_HOST: datadog-agent
@@ -362,5 +338,4 @@ networks:
 
 volumes:
   minio_data:
-  mongodb_data:
   datadog_socket:

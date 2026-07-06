@@ -30,10 +30,9 @@ echo "[Test 4] Verificar MinIO buckets..."
 docker compose exec minio mc ls local/bronze 2>/dev/null || echo "No bronze data yet"
 echo ""
 
-# Test 5: Check MongoDB collections
-echo "[Test 5] Verificar MongoDB..."
-docker compose exec mongodb mongosh -u admin -p admin123 --eval \
-    "db.hourly_metrics.countDocuments({})" 2>/dev/null || echo "No metrics yet"
+# Test 5: Check MinIO Gold layer (replaces MongoDB)
+echo "[Test 5] Verificar MinIO (Gold/processed data)..."
+docker compose exec minio mc ls local/gold 2>/dev/null || echo "No gold data yet"
 echo ""
 
 # Test 6: API endpoints

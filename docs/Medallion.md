@@ -77,12 +77,13 @@ La capa curada contiene datos específicos del negocio, listos para consumo.
 
 **Nuestro Caso**:
 ```
-Formato: MongoDB BSON
-Procesador: Transformación Custom
-Almacenamiento: MongoDB
-Colecciones:
-  - hourly_metrics
-  - incident_reports
+Formato: JSON
+Procesador: Gold Transformer (Python)
+Almacenamiento: MinIO (gold bucket)
+Particionamiento: date=YYYY-MM-DD
+Tipos de Datos:
+  - hourly_metrics/
+  - incident_reports/
 Retención: Indefinida
 ```
 
@@ -97,7 +98,7 @@ T+100ms: Evento en Bronze (JSON)
 T+5min:  Lote en Bronze listo para procesar
 T+7min:  Datos en Silver (Parquet)
 T+10min: Agregaciones calculadas
-T+12min: Datos en Gold (MongoDB)
+T+12min: Datos en Gold (MinIO JSON)
 T+13min: Disponible en API
 ```
 
@@ -154,18 +155,14 @@ Cualquier análisis puede referenciar datos de momentos específicos.
 
 ### Gold
 
-Con MongoDB, se puede añadir versionamiento:
+Con particionamiento por fecha en MinIO, el versionamiento es implícito:
 
-```javascript
-{
-  "_id": ObjectId(),
-  "timestamp": ISODate(),
-  "version": 1,
-  "data": {...},
-  "created_at": ISODate(),
-  "ttl_index": ISODate()  // Para auto-delete
-}
 ```
+s3://gold/hourly_metrics/date=2024-01-15/
+s3://gold/hourly_metrics/date=2024-01-16/
+```
+
+Cada ejecución del Gold Transformer produce archivos nuevos que pueden ser consumidos por la API.
 
 ## Casos de Uso
 
@@ -214,8 +211,8 @@ Con MongoDB, se puede añadir versionamiento:
 ✓ Aplicar reglas de calidad
 
 ### 4. Gold sin Particionamiento
-❌ Colleción MongoDB sin índices
-✓ Crear índices apropiados
+❌ Datos Gold sin particionar
+✓ Particionar por fecha para consultas eficientes
 
 ## Monitoreo de Medallion
 
@@ -258,7 +255,8 @@ FROM gold_queries
 ### Fase 1 (Actual)
 - Bronze: JSON en MinIO
 - Silver: Parquet en MinIO
-- Gold: MongoDB
+- Gold: JSON en MinIO
+- API: FastAPI leyendo desde MinIO Gold (sin MongoDB)
 
 ### Fase 2 (Próxima)
 - Agregar Delta Lake

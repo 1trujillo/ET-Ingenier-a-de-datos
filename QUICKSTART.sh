@@ -32,7 +32,6 @@ echo "Servicios que se levantarán:"
 echo "  ✓ Zookeeper (2181)"
 echo "  ✓ Kafka (9092)"
 echo "  ✓ MinIO S3 (9000, 9001)"
-echo "  ✓ MongoDB (27017)"
 echo "  ✓ Datadog Agent (8126)"
 echo "  ✓ Data Generator"
 echo "  ✓ Streaming Worker (Bronze)"
@@ -53,7 +52,7 @@ echo ""
 echo "🏥 Verificando salud de servicios..."
 
 HEALTHY=0
-TOTAL=11
+TOTAL=10
 
 # Verificar FastAPI
 if curl -s http://localhost/health > /dev/null 2>&1; then
@@ -61,14 +60,6 @@ if curl -s http://localhost/health > /dev/null 2>&1; then
     HEALTHY=$((HEALTHY + 1))
 else
     echo "  ⏳ FastAPI (iniciando...)"
-fi
-
-# Verificar MongoDB
-if docker compose exec -T mongodb mongosh --eval "db.adminCommand('ping')" > /dev/null 2>&1; then
-    echo "  ✅ MongoDB"
-    HEALTHY=$((HEALTHY + 1))
-else
-    echo "  ⏳ MongoDB (iniciando...)"
 fi
 
 # Verificar Kafka
@@ -102,8 +93,10 @@ echo "  🪣 MinIO Console:"
 echo "     http://localhost:9001"
 echo "     Credenciales: minioadmin / minioadmin"
 echo ""
-echo "  🗂️ MongoDB:"
-echo "     mongodb://admin:admin123@localhost:27017"
+echo "  Capas de datos (todo en MinIO):"
+echo "     - Bronze: datos crudos (JSON)"
+echo "     - Silver: datos limpios (Parquet)"
+echo "     - Gold: métricas e incidentes (JSON)"
 echo ""
 echo "  📈 Datadog (si está configurado):"
 echo "     https://app.datadoghq.com"
@@ -130,9 +123,8 @@ echo "4️⃣  VERIFICAR DATOS EN BRONZE:"
 echo "    docker compose exec minio mc ls local/bronze/raw"
 echo ""
 
-echo "5️⃣  CONSULTAR MONGODB:"
-echo "    docker compose exec mongodb mongosh -u admin -p admin123 \\
-      --eval \"db.hourly_metrics.countDocuments({})\""
+echo "5️⃣  CONSULTAR GOLD (MinIO):"
+echo "    docker compose exec minio mc ls local/gold/hourly_metrics/"
 echo ""
 
 echo "╔════════════════════════════════════════════════════════════╗"

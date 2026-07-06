@@ -1,13 +1,13 @@
 import json
 import logging
 import os
+import io
 import time
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Any
+from collections import defaultdict
 
 import boto3
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
 from opentelemetry import metrics, trace
 
 try:
@@ -94,72 +94,10 @@ MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', 'minio:9000')
 MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
 MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
 MINIO_BUCKET_SILVER = os.getenv('MINIO_BUCKET_SILVER', 'silver')
-
-MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://admin:admin123@mongodb:27017/data_platform?authSource=admin')
-
-# ============================================
-# CLIENTE MONGODB
-# ============================================
-
-class MongoDBClient:
-    def __init__(self):
-        self.client: Optional[MongoClient] = None
-        self.db = None
-        self._connect()
-
-    def _connect(self):
-        """Conectar a MongoDB"""
-        retry_count = 0
-        max_retries = 5
-        
-        while retry_count < max_retries:
-            try:
-                self.client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-                self.client.admin.command('ping')
-                self.db = self.client['data_platform']
-                logger.info("Connected to MongoDB")
-                statsd_client.gauge('mongodb_connection_attempts', retry_count)
-                return True
-            except Exception as e:
-                retry_count += 1
-                logger.warning(f"MongoDB connection attempt {retry_count}/{max_retries} failed: {str(e)}")
-                if retry_count < max_retries:
-                    time.sleep(5)
-                else:
-                    logger.error(f"Failed to connect to MongoDB after {max_retries} attempts")
-                    raise
-
-    def insert_many(self, collection_name: str, documents: List[Dict]) -> int:
-        """Insertar múltiples documentos"""
-        try:
-            with tracer.start_as_current_span("mongodb_insert"):
-                collection = self.db[collection_name]
-                result = collection.insert_many(documents)
-                statsd_client.increment('documents.inserted', len(result.inserted_ids))
-                return len(result.inserted_ids)
-        except PyMongoError as e:
-            logger.error(f"Error inserting documents: {str(e)}")
-            statsd_client.increment('documents.insert_failed')
-            return 0
-
-    def update_many(self, collection_name: str, query: Dict, update: Dict):
-        """Actualizar múltiples documentos"""
-        try:
-            with tracer.start_as_current_span("mongodb_update"):
-                collection = self.db[collection_name]
-                result = collection.update_many(query, {'$set': update})
-                return result.modified_count
-        except PyMongoError as e:
-            logger.error(f"Error updating documents: {str(e)}")
-            return 0
-
-    def close(self):
-        """Cerrar conexión"""
-        if self.client:
-            self.client.close()
+MINIO_BUCKET_GOLD = os.getenv('MINIO_BUCKET_GOLD', 'gold')
 
 # ============================================
-# CLIENTE S3
+# CLIENTE S3 (MinIO)
 # ============================================
 
 class S3Client:
@@ -171,6 +109,14 @@ class S3Client:
             aws_secret_access_key=MINIO_SECRET_KEY,
             region_name='us-east-1'
         )
+        self._ensure_bucket_exists(MINIO_BUCKET_GOLD)
+
+    def _ensure_bucket_exists(self, bucket: str):
+        """Crear bucket si no existe"""
+        try:
+            self.s3_client.head_bucket(Bucket=bucket)
+        except Exception:
+            self.s3_client.create_bucket(Bucket=bucket)
 
     def list_parquet_files(self, prefix: str = "processed/") -> List[str]:
         """Listar archivos Parquet en Silver"""
@@ -179,30 +125,76 @@ class S3Client:
                 Bucket=MINIO_BUCKET_SILVER,
                 Prefix=prefix
             )
-            
+
             if 'Contents' not in response:
                 return []
-            
+
             return [obj['Key'] for obj in response['Contents'] if obj['Key'].endswith('.parquet')]
         except Exception as e:
             logger.error(f"Error listing S3 objects: {str(e)}")
             return []
 
-    def read_parquet_file(self, key: str) -> Optional[Dict]:
-        """Leer archivo Parquet"""
+    def read_parquet_file(self, key: str) -> Optional[List[Dict]]:
+        """Leer archivo Parquet desde MinIO"""
         try:
             import pyarrow.parquet as pq
-            
+
             obj = self.s3_client.get_object(
                 Bucket=MINIO_BUCKET_SILVER,
                 Key=key
             )
-            
-            parquet_file = pq.read_table(obj['Body'])
+
+            # Envolver en BytesIO para que PyArrow pueda realizar búsquedas (seek)
+            buffer = io.BytesIO(obj['Body'].read())
+            parquet_file = pq.read_table(buffer)
             return parquet_file.to_pandas().to_dict('records')
         except Exception as e:
-            logger.error(f"Error reading parquet file: {str(e)}")
+            logger.error(f"Error reading parquet file {key}: {str(e)}")
             return None
+
+    def write_json(self, bucket: str, key: str, data: List[Dict]):
+        """Escribir datos JSON a MinIO"""
+        try:
+            self.s3_client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=json.dumps(data, default=str),
+                ContentType='application/json'
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error writing JSON to MinIO: {str(e)}")
+            return False
+
+    def read_json(self, bucket: str, prefix: str) -> List[Dict]:
+        """Leer datos JSON desde MinIO"""
+        try:
+            response = self.s3_client.list_objects_v2(
+                Bucket=bucket,
+                Prefix=prefix
+            )
+
+            if 'Contents' not in response:
+                return []
+
+            all_records = []
+            for obj in response['Contents']:
+                if not obj['Key'].endswith('.json'):
+                    continue
+                obj_response = self.s3_client.get_object(
+                    Bucket=bucket,
+                    Key=obj['Key']
+                )
+                content = json.loads(obj_response['Body'].read().decode('utf-8'))
+                if isinstance(content, list):
+                    all_records.extend(content)
+                else:
+                    all_records.append(content)
+
+            return all_records
+        except Exception as e:
+            logger.error(f"Error reading JSON from MinIO: {str(e)}")
+            return []
 
 # ============================================
 # GOLD TRANSFORMER
@@ -210,7 +202,6 @@ class S3Client:
 
 class GoldTransformer:
     def __init__(self):
-        self.mongodb_client = MongoDBClient()
         self.s3_client = S3Client()
         self.last_processed_time = datetime.utcnow()
 
@@ -218,10 +209,10 @@ class GoldTransformer:
         """Generar métricas de tráfico"""
         if not records:
             return {}
-        
+
         speeds = [r.get('average_speed', 0) for r in records if 'average_speed' in r]
         densities = [r.get('traffic_density', 0) for r in records if 'traffic_density' in r]
-        
+
         return {
             'avg_speed': float(np.mean(speeds)) if speeds else 0,
             'max_speed': float(np.max(speeds)) if speeds else 0,
@@ -235,10 +226,10 @@ class GoldTransformer:
         """Generar métricas de calidad del aire"""
         if not records:
             return {}
-        
+
         aqi_values = [r.get('air_quality_index', 0) for r in records if 'air_quality_index' in r]
         noise_levels = [r.get('noise_level', 0) for r in records if 'noise_level' in r]
-        
+
         return {
             'avg_aqi': float(np.mean(aqi_values)) if aqi_values else 0,
             'max_aqi': float(np.max(aqi_values)) if aqi_values else 0,
@@ -249,10 +240,8 @@ class GoldTransformer:
 
     def generate_hourly_aggregates(self, records: List[Dict]) -> List[Dict]:
         """Generar agregados por hora"""
-        from collections import defaultdict
-        
         aggregates = defaultdict(list)
-        
+
         for record in records:
             key = (
                 record.get('year'),
@@ -262,36 +251,36 @@ class GoldTransformer:
                 record.get('sensor_type')
             )
             aggregates[key].append(record)
-        
+
         result = []
         for (year, month, day, hour, sensor_type), group_records in aggregates.items():
             if sensor_type == 'traffic':
-                metrics = self.generate_traffic_metrics(group_records)
+                metrics_data = self.generate_traffic_metrics(group_records)
             elif sensor_type == 'air_quality':
-                metrics = self.generate_air_quality_metrics(group_records)
+                metrics_data = self.generate_air_quality_metrics(group_records)
             else:
-                metrics = {'records_count': len(group_records)}
-            
+                metrics_data = {'records_count': len(group_records)}
+
             result.append({
-                'timestamp': datetime(year, month, day, hour),
+                'timestamp': datetime(year, month, day, hour).isoformat(),
                 'year': year,
                 'month': month,
                 'day': day,
                 'hour': hour,
                 'sensor_type': sensor_type,
-                'metrics': metrics,
+                'metrics': metrics_data,
                 'record_count': len(group_records)
             })
-        
+
         return result
 
     def generate_incident_reports(self, records: List[Dict]) -> List[Dict]:
         """Generar reportes de incidentes"""
         incidents = [r for r in records if r.get('incident_detected', False)]
-        
+
         return [
             {
-                'timestamp': r.get('timestamp'),
+                'timestamp': r.get('timestamp').isoformat() if hasattr(r.get('timestamp'), 'isoformat') else r.get('timestamp'),
                 'sensor_id': r.get('sensor_id'),
                 'sensor_type': r.get('sensor_type'),
                 'incident_type': r.get('incident_type'),
@@ -305,44 +294,61 @@ class GoldTransformer:
         ]
 
     def transform_and_load(self):
-        """Transformar datos de Silver a Gold"""
+        """Transformar datos de Silver a Gold y almacenar en MinIO"""
         transformation_runs.add(1)
         start_time = time.time()
-        
+
         try:
             with tracer.start_as_current_span("transform_to_gold"):
                 logger.info("Starting Gold transformation")
+
+                # 1. Listar los archivos Parquet reales desde el bucket Silver en MinIO
+                parquet_files = self.s3_client.list_parquet_files("processed/")
                 
-                # Simular lectura desde archivos Parquet
-                # En producción, se leerían archivos reales
-                # Por ahora generamos datos de ejemplo
-                
-                sample_records = self._generate_sample_records()
-                
-                if not sample_records:
-                    logger.warning("No records to transform")
+                if not parquet_files:
+                    logger.warning("No se encontraron archivos Parquet en la capa Silver (s3://silver/processed/)")
                     return
-                
-                # Generar agregados por hora
-                hourly_aggregates = self.generate_hourly_aggregates(sample_records)
+
+                # 2. Leer y consolidar los registros de todos los archivos encontrados
+                silver_records = []
+                for file_key in parquet_files:
+                    records = self.s3_client.read_parquet_file(file_key)
+                    if records:
+                        silver_records.extend(records)
+
+                if not silver_records:
+                    logger.warning("Los archivos Parquet se leyeron pero no contienen registros válidos")
+                    return
+
+                logger.info(f"Se cargaron {len(silver_records)} registros reales desde la capa Silver para transformar")
+
+                now = datetime.utcnow()
+                date_str = now.strftime("%Y-%m-%d")
+
+                # 3. Generar agregados por hora
+                hourly_aggregates = self.generate_hourly_aggregates(silver_records)
                 if hourly_aggregates:
-                    count = self.mongodb_client.insert_many('hourly_metrics', hourly_aggregates)
-                    documents_created.add(count)
-                    logger.info(f"Inserted {count} hourly metrics")
-                
-                # Generar reportes de incidentes
-                incident_reports = self.generate_incident_reports(sample_records)
+                    key = f"hourly_metrics/date={date_str}/{int(time.time() * 1000)}.json"
+                    if self.s3_client.write_json(MINIO_BUCKET_GOLD, key, hourly_aggregates):
+                        documents_created.add(len(hourly_aggregates))
+                        logger.info(f"Wrote {len(hourly_aggregates)} hourly metrics to gold/{key}")
+                        statsd_client.increment('documents.inserted', len(hourly_aggregates))
+
+                # 4. Generar reportes de incidentes
+                incident_reports = self.generate_incident_reports(silver_records)
                 if incident_reports:
-                    count = self.mongodb_client.insert_many('incident_reports', incident_reports)
-                    documents_created.add(count)
-                    logger.info(f"Inserted {count} incident reports")
-                
+                    key = f"incident_reports/date={date_str}/{int(time.time() * 1000)}.json"
+                    if self.s3_client.write_json(MINIO_BUCKET_GOLD, key, incident_reports):
+                        documents_created.add(len(incident_reports))
+                        logger.info(f"Wrote {len(incident_reports)} incident reports to gold/{key}")
+                        statsd_client.increment('documents.inserted', len(incident_reports))
+
                 elapsed = time.time() - start_time
                 transformation_duration.record(elapsed)
                 statsd_client.histogram('transformation.duration_seconds', elapsed)
-                
+
                 logger.info(f"Gold transformation completed in {elapsed:.2f} seconds")
-                
+
         except Exception as e:
             logger.error(f"Critical error in transformation: {str(e)}")
             statsd_client.increment('transformation.failed')
@@ -351,10 +357,10 @@ class GoldTransformer:
         """Generar registros de ejemplo (simular lectura de Parquet)"""
         import random
         from datetime import datetime
-        
+
         now = datetime.utcnow()
         records = []
-        
+
         for i in range(100):
             records.append({
                 'sensor_id': f'SENSOR_{random.randint(1, 100):04d}',
@@ -374,7 +380,7 @@ class GoldTransformer:
                 'intersection': f'INT_{random.randint(1, 50):04d}',
                 'timestamp': datetime(now.year, now.month, now.day, now.hour)
             })
-        
+
         return records
 
     def run_scheduler(self):
@@ -384,8 +390,9 @@ class GoldTransformer:
                 self.transform_and_load()
             except Exception as e:
                 logger.error(f"Error in transformation scheduler: {str(e)}")
-            
+
             time.sleep(600)  # 10 minutos
+
 
 # ============================================
 # MAIN
@@ -393,7 +400,4 @@ class GoldTransformer:
 
 if __name__ == "__main__":
     transformer = GoldTransformer()
-    try:
-        transformer.run_scheduler()
-    finally:
-        transformer.mongodb_client.close()
+    transformer.run_scheduler()

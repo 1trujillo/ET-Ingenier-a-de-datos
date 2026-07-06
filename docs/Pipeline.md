@@ -256,7 +256,7 @@ Cada 10 minutos:
 1. Leer Silver (últimos 10 min)
 2. Agregaciones por hora
 3. Detección de incidentes
-4. Insertar en MongoDB
+4. Escribir en MinIO Gold (JSON)
 ```
 
 ### Agregaciones
@@ -292,14 +292,12 @@ incidents = df.filter(col('incident_detected') == True).select(
 
 ### Resultados
 
-```javascript
-// Hourly Metrics
-db.hourly_metrics
-  100-200 documentos por 10 minutos
+```
+Hourly Metrics (MinIO gold/hourly_metrics/):
+  100-200 métricas por 10 minutos
 
-// Incident Reports
-db.incident_reports
-  5-10 documentos por 10 minutos
+Incident Reports (MinIO gold/incident_reports/):
+  5-10 reportes por 10 minutos
   (1% de eventos son incidentes)
 ```
 
@@ -351,10 +349,10 @@ Response:
 ### Latencia
 
 - API Request: ~50ms
-- MongoDB Query: ~20ms
+- MinIO Gold Read: ~30ms
 - Serialización JSON: ~10ms
 - Nginx Proxy: ~5ms
-- **Total: ~85ms (P95)**
+- **Total: ~95ms (P95)**
 
 ## 7. Flujo Completo End-to-End
 
@@ -367,7 +365,7 @@ T+50ms:  Eventos en Bronze MinIO
 T+5min:  ETL procesa batch
 T+7min:  Datos en Silver MinIO
 T+10min: Gold Transformer agrega
-T+12min: Documentos en MongoDB
+T+12min: Datos en Gold MinIO
 T+12.5min: API expone datos
 T+13min: Consulta desde cliente
 

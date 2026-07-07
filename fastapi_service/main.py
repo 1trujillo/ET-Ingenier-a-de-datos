@@ -416,6 +416,83 @@ async def get_aggregations_by_sensor_type(hours: int = Query(24, ge=1, le=720)):
 # ENDPOINTS - STATS
 # ============================================
 
+@app.get("/api/v1/traffic/by-minute")
+async def get_traffic_by_minute(hours: int = Query(24, ge=1, le=720)):
+    """Obtener vehículos por minuto desde Gold."""
+    start_time = time.time()
+    try:
+        with tracer.start_as_current_span("get_traffic_by_minute"):
+            requests_total.add(1)
+            records = minio_client.read_all_json("traffic_metrics/")
+            filtered = []
+            for item in records:
+                if not isinstance(item, dict):
+                    continue
+                payload = item.get('by_minute', [])
+                if isinstance(payload, list):
+                    filtered.extend(payload)
+            since = datetime.utcnow() - timedelta(hours=hours)
+            filtered = [
+                r for r in filtered
+                if isinstance(r.get('timestamp'), str) and datetime.fromisoformat(r['timestamp'].replace('Z', '+00:00')) >= since
+            ]
+            filtered.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+            statsd_client.histogram('endpoint.traffic_by_minute.duration_ms', elapsed)
+            return filtered
+    except Exception as e:
+        logger.error(f"Error fetching traffic by minute: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/traffic/by-avenue")
+async def get_traffic_by_avenue(hours: int = Query(24, ge=1, le=720)):
+    """Obtener vehículos por avenida desde Gold."""
+    start_time = time.time()
+    try:
+        with tracer.start_as_current_span("get_traffic_by_avenue"):
+            requests_total.add(1)
+            records = minio_client.read_all_json("traffic_metrics/")
+            filtered = []
+            for item in records:
+                if not isinstance(item, dict):
+                    continue
+                payload = item.get('by_avenue', [])
+                if isinstance(payload, list):
+                    filtered.extend(payload)
+            filtered.sort(key=lambda x: x.get('total_vehicles', 0), reverse=True)
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+            statsd_client.histogram('endpoint.traffic_by_avenue.duration_ms', elapsed)
+            return filtered
+    except Exception as e:
+        logger.error(f"Error fetching traffic by avenue: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/traffic/by-district")
+async def get_traffic_by_district(hours: int = Query(24, ge=1, le=720)):
+    """Obtener vehículos por comuna desde Gold."""
+    start_time = time.time()
+    try:
+        with tracer.start_as_current_span("get_traffic_by_district"):
+            requests_total.add(1)
+            records = minio_client.read_all_json("traffic_metrics/")
+            filtered = []
+            for item in records:
+                if not isinstance(item, dict):
+                    continue
+                payload = item.get('by_district', [])
+                if isinstance(payload, list):
+                    filtered.extend(payload)
+            filtered.sort(key=lambda x: x.get('total_vehicles', 0), reverse=True)
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+            statsd_client.histogram('endpoint.traffic_by_district.duration_ms', elapsed)
+            return filtered
+    except Exception as e:
+        logger.error(f"Error fetching traffic by district: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/v1/stats/database")
 async def get_database_stats():
     """Obtener estadísticas de la base de datos (Gold layer en MinIO)"""

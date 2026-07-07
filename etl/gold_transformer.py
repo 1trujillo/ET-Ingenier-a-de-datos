@@ -238,17 +238,84 @@ class GoldTransformer:
             'max_noise': float(np.max(noise_levels)) if noise_levels else 0,
         }
 
+    def generate_traffic_aggregates(self, records: List[Dict]) -> Dict[str, Any]:
+        """Generar agregados de movilidad por minuto, avenida y comuna."""
+        if not records:
+            return {}
+
+        minute_bucket = defaultdict(int)
+        avenue_bucket = defaultdict(int)
+        district_bucket = defaultdict(int)
+
+        for record in records:
+            timestamp = record.get('timestamp')
+            if isinstance(timestamp, datetime):
+                minute_key = timestamp.strftime('%Y-%m-%dT%H:%M')
+            else:
+                minute_key = str(timestamp)[:16] if timestamp else 'unknown'
+
+            vehicle_count = int(record.get('vehicle_count', 0) or 0)
+            avenue = record.get('avenue', 'unknown')
+            district = record.get('district', 'unknown')
+
+            minute_bucket[minute_key] += vehicle_count
+            avenue_bucket[avenue] += vehicle_count
+            district_bucket[district] += vehicle_count
+
+        return {
+            'by_minute': [
+                {'timestamp': ts, 'total_vehicles': total}
+                for ts, total in sorted(minute_bucket.items())
+            ],
+            'by_avenue': [
+                {'avenue': avenue, 'total_vehicles': total}
+                for avenue, total in sorted(avenue_bucket.items())
+            ],
+            'by_district': [
+                {'district': district, 'total_vehicles': total}
+                for district, total in sorted(district_bucket.items())
+            ]
+        }
+
+    def _extract_record_datetime(self, record: Dict[str, Any]) -> Optional[datetime]:
+        """Extraer un datetime válido desde un registro de Silver."""
+        timestamp = record.get('timestamp')
+        if isinstance(timestamp, datetime):
+            return timestamp
+
+        if isinstance(timestamp, str):
+            try:
+                return datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            except Exception:
+                pass
+
+        try:
+            year = record.get('year')
+            month = record.get('month')
+            day = record.get('day')
+            hour = record.get('hour')
+            if all(value is not None for value in (year, month, day, hour)):
+                return datetime(int(year), int(month), int(day), int(hour))
+        except Exception:
+            pass
+
+        return None
+
     def generate_hourly_aggregates(self, records: List[Dict]) -> List[Dict]:
         """Generar agregados por hora"""
         aggregates = defaultdict(list)
 
         for record in records:
+            timestamp = self._extract_record_datetime(record)
+            if timestamp is None:
+                continue
+
             key = (
-                record.get('year'),
-                record.get('month'),
-                record.get('day'),
-                record.get('hour'),
-                record.get('sensor_type')
+                timestamp.year,
+                timestamp.month,
+                timestamp.day,
+                timestamp.hour,
+                str(record.get('sensor_type') or 'unknown').lower()
             )
             aggregates[key].append(record)
 
@@ -333,6 +400,14 @@ class GoldTransformer:
                         documents_created.add(len(hourly_aggregates))
                         logger.info(f"Wrote {len(hourly_aggregates)} hourly metrics to gold/{key}")
                         statsd_client.increment('documents.inserted', len(hourly_aggregates))
+
+                traffic_aggregates = self.generate_traffic_aggregates(silver_records)
+                if traffic_aggregates:
+                    key = f"traffic_metrics/date={date_str}/{int(time.time() * 1000)}.json"
+                    if self.s3_client.write_json(MINIO_BUCKET_GOLD, key, [traffic_aggregates]):
+                        documents_created.add(1)
+                        logger.info(f"Wrote traffic aggregates to gold/{key}")
+                        statsd_client.increment('documents.inserted', 1)
 
                 # 4. Generar reportes de incidentes
                 incident_reports = self.generate_incident_reports(silver_records)

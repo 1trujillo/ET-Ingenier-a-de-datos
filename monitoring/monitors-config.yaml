@@ -102,6 +102,21 @@ dashboards:
         type: table
         query: "avg:fastapi.endpoint.*_duration_ms{} by {endpoint}"
 
+  - name: "Mobility Metrics"
+    description: "Urban mobility business metrics"
+    widgets:
+      - title: "Vehículos por minuto"
+        type: timeseries
+        query: "sum:movilidad.vehiculos_por_minuto{}.as_count()"
+
+      - title: "Vehículos por avenida"
+        type: toplist
+        query: "sum:movilidad.vehiculos_por_avenida{} by {avenue}"
+
+      - title: "Vehículos por comuna"
+        type: toplist
+        query: "sum:movilidad.vehiculos_por_comuna{} by {district}"
+
   - name: "System Metrics"
     description: "Docker and system resource metrics"
     widgets:

@@ -64,6 +64,9 @@ Enviadas por cada servicio:
 generator.events_produced
 generator.events_failed
 generator.production_latency_ms
+movilidad.vehiculos_por_minuto
+movilidad.vehiculos_por_avenida
+movilidad.vehiculos_por_comuna
 ```
 
 ### Streaming Worker
@@ -119,6 +122,18 @@ Type: Timeseries
 Widget 4: Documents Created
 Query: sum:gold_transformer.documents_created{}.as_count()
 Type: Timeseries
+
+Widget 5: Vehículos por minuto
+Query: sum:movilidad.vehiculos_por_minuto{}.as_count()
+Type: Timeseries
+
+Widget 6: Vehículos por avenida
+Query: sum:movilidad.vehiculos_por_avenida{} by {avenue}
+Type: Top List
+
+Widget 7: Vehículos por comuna
+Query: sum:movilidad.vehiculos_por_comuna{} by {district}
+Type: Top List
 ```
 
 ### Dashboard: Infrastructure

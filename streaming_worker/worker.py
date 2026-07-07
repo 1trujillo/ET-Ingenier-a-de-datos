@@ -7,6 +7,7 @@ from typing import Optional
 
 import boto3
 from kafka import KafkaConsumer
+from kafka.admin import KafkaAdminClient, NewTopic
 from opentelemetry import metrics, trace
 
 try:
@@ -138,7 +139,7 @@ class MinIOClient:
                 self.s3_client.put_object(
                     Bucket=self.bucket,
                     Key=key,
-                    Body=json.dumps(event),
+                    Body=json.dumps(event, default=str).encode('utf-8'),
                     ContentType='application/json'
                 )
                 
@@ -159,6 +160,20 @@ class StreamingWorker:
         self.consumer: Optional[KafkaConsumer] = None
         self.minio_client = MinIOClient()
 
+    def ensure_topic(self):
+        """Asegurar que el topic exista y esté limpio para la ingesta de Bronze."""
+        try:
+            admin_client = KafkaAdminClient(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS], client_id='worker-admin')
+            topics = admin_client.list_topics()
+            if KAFKA_TOPIC in topics:
+                admin_client.delete_topics([KAFKA_TOPIC], timeout_ms=10000)
+                time.sleep(2)
+            admin_client.create_topics([NewTopic(name=KAFKA_TOPIC, num_partitions=1, replication_factor=1)], timeout_ms=10000)
+            admin_client.close()
+            logger.info(f"Ensured Kafka topic {KAFKA_TOPIC} exists")
+        except Exception as exc:
+            logger.warning(f"Topic bootstrap skipped: {exc}")
+
     def connect_kafka(self):
         """Conectar a Kafka"""
         retry_count = 0
@@ -166,6 +181,7 @@ class StreamingWorker:
         
         while retry_count < max_retries:
             try:
+                self.ensure_topic()
                 self.consumer = KafkaConsumer(
                     KAFKA_TOPIC,
                     bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],

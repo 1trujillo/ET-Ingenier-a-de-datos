@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 from typing import Dict, Any
 
 import numpy as np
-from faker import Faker
 from kafka import KafkaProducer
+from kafka.admin import KafkaAdminClient, NewTopic
 from opentelemetry import metrics, trace
 
 try:
@@ -90,6 +90,24 @@ production_latency = meter.create_histogram(
     unit="ms"
 )
 
+traffic_vehicle_volume = meter.create_counter(
+    name="movilidad.vehiculos_por_minuto",
+    description="Vehicles observed per minute",
+    unit="1"
+)
+
+traffic_vehicle_by_avenue = meter.create_counter(
+    name="movilidad.vehiculos_por_avenida",
+    description="Vehicles observed by avenue",
+    unit="1"
+)
+
+traffic_vehicle_by_district = meter.create_counter(
+    name="movilidad.vehiculos_por_comuna",
+    description="Vehicles observed by district",
+    unit="1"
+)
+
 # ============================================
 # CONFIGURACIÓN
 # ============================================
@@ -100,15 +118,31 @@ NUM_SENSORS = 100
 BATCH_SIZE = 50
 INTERVAL_SECONDS = 2
 
-# Coordenadas ficticias de la ciudad
-CITY_CENTER_LAT = -12.0462
-CITY_CENTER_LNG = -77.0371
-LAT_RANGE = 0.1
-LNG_RANGE = 0.1
-
 SENSOR_TYPES = ['traffic', 'air_quality', 'noise', 'weather', 'incident']
 LIGHT_STATUS = ['green', 'red', 'yellow']
 INCIDENT_TYPES = ['accident', 'congestion', 'breakdown', 'road_closure', 'none']
+LOCATIONS = [
+    {"intersection": "INT_001", "avenue": "Alameda", "district": "Santiago Centro", "latitude": -33.4378, "longitude": -70.6504},
+    {"intersection": "INT_002", "avenue": "Alameda", "district": "Estación Central", "latitude": -33.4517, "longitude": -70.6765},
+    {"intersection": "INT_003", "avenue": "Av. Providencia", "district": "Providencia", "latitude": -33.4372, "longitude": -70.6303},
+    {"intersection": "INT_004", "avenue": "Av. Apoquindo", "district": "Las Condes", "latitude": -33.4218, "longitude": -70.6067},
+    {"intersection": "INT_005", "avenue": "Av. Vitacura", "district": "Vitacura", "latitude": -33.3938, "longitude": -70.5885},
+    {"intersection": "INT_006", "avenue": "Av. 10 de Julio", "district": "Lo Prado", "latitude": -33.4399, "longitude": -70.7151},
+    {"intersection": "INT_007", "avenue": "Av. Recoleta", "district": "Recoleta", "latitude": -33.4210, "longitude": -70.6508},
+    {"intersection": "INT_008", "avenue": "Av. Matta", "district": "Estación Central", "latitude": -33.4479, "longitude": -70.6753},
+    {"intersection": "INT_009", "avenue": "Av. España", "district": "Santiago Centro", "latitude": -33.4410, "longitude": -70.6542},
+    {"intersection": "INT_010", "avenue": "Av. Libertador B. O'Higgins", "district": "Santiago Centro", "latitude": -33.4480, "longitude": -70.6634},
+    {"intersection": "INT_011", "avenue": "Av. Grecia", "district": "Ñuñoa", "latitude": -33.4591, "longitude": -70.6138},
+    {"intersection": "INT_012", "avenue": "Av. Irarrázaval", "district": "Ñuñoa", "latitude": -33.4557, "longitude": -70.6121},
+    {"intersection": "INT_013", "avenue": "Av. San Diego", "district": "Santiago Centro", "latitude": -33.4447, "longitude": -70.6510},
+    {"intersection": "INT_014", "avenue": "Av. Santa Rosa", "district": "Las Condes", "latitude": -33.4130, "longitude": -70.5780},
+    {"intersection": "INT_015", "avenue": "Av. Grecia", "district": "Providencia", "latitude": -33.4310, "longitude": -70.6205},
+    {"intersection": "INT_016", "avenue": "Av. Ejército", "district": "Santiago Centro", "latitude": -33.4302, "longitude": -70.6507},
+    {"intersection": "INT_017", "avenue": "Av. Pajaritos", "district": "Lo Espejo", "latitude": -33.5275, "longitude": -70.6965},
+    {"intersection": "INT_018", "avenue": "Av. Vicuña Mackenna", "district": "Macul", "latitude": -33.4920, "longitude": -70.6196},
+    {"intersection": "INT_019", "avenue": "Av. Principal", "district": "La Cisterna", "latitude": -33.5401, "longitude": -70.6649},
+    {"intersection": "INT_020", "avenue": "Av. Circunvalación", "district": "San Miguel", "latitude": -33.4932, "longitude": -70.6498},
+]
 
 # ============================================
 # GENERADOR DE EVENTOS
@@ -116,12 +150,22 @@ INCIDENT_TYPES = ['accident', 'congestion', 'breakdown', 'road_closure', 'none']
 
 class EventGenerator:
     def __init__(self):
-        self.fake = Faker()
         self.producer = None
         self.sensor_ids = [f"SENSOR_{i:04d}" for i in range(1, NUM_SENSORS + 1)]
-        self.intersections = [
-            f"INT_{i:04d}" for i in range(1, NUM_SENSORS // 2 + 1)
-        ]
+
+    def ensure_topic(self):
+        """Crear o recrear el topic de Kafka para evitar mensajes antiguos con codec incompatibles."""
+        try:
+            admin_client = KafkaAdminClient(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS], client_id='generator-admin')
+            topics = admin_client.list_topics()
+            if KAFKA_TOPIC in topics:
+                admin_client.delete_topics([KAFKA_TOPIC], timeout_ms=10000)
+                time.sleep(2)
+            admin_client.create_topics([NewTopic(name=KAFKA_TOPIC, num_partitions=1, replication_factor=1)], timeout_ms=10000)
+            admin_client.close()
+            logger.info(f"Ensured Kafka topic {KAFKA_TOPIC} exists")
+        except Exception as exc:
+            logger.warning(f"Topic bootstrap skipped: {exc}")
 
     def connect_kafka(self):
         """Conectar a Kafka"""
@@ -130,11 +174,11 @@ class EventGenerator:
             max_retries = 5
             while retry_count < max_retries:
                 try:
+                    self.ensure_topic()
                     self.producer = KafkaProducer(
                         bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
                         value_serializer=lambda v: json.dumps(v).encode('utf-8'),
                         acks='all',
-                        compression_type='snappy',
                         request_timeout_ms=30000,
                         retries=3
                     )
@@ -150,19 +194,45 @@ class EventGenerator:
                         logger.error(f"Failed to connect to Kafka after {max_retries} attempts")
                         return False
 
+    def _emit_traffic_metrics(self, event: Dict[str, Any]):
+        """Emitir métricas de movilidad a OTel y DogStatsD."""
+        vehicle_count = int(event.get('vehicle_count', 0) or 0)
+        avenue = event.get('avenue', 'unknown')
+        district = event.get('district', 'unknown')
+
+        traffic_vehicle_volume.add(vehicle_count)
+        traffic_vehicle_by_avenue.add(vehicle_count, attributes={'avenue': avenue})
+        traffic_vehicle_by_district.add(vehicle_count, attributes={'district': district})
+
+        try:
+            statsd_client.increment('movilidad.vehiculos_por_minuto', value=vehicle_count)
+            statsd_client.increment(
+                'movilidad.vehiculos_por_avenida',
+                value=vehicle_count,
+                tags=[f'avenue:{avenue}']
+            )
+            statsd_client.increment(
+                'movilidad.vehiculos_por_comuna',
+                value=vehicle_count,
+                tags=[f'district:{district}']
+            )
+        except TypeError:
+            statsd_client.increment('movilidad.vehiculos_por_avenida', value=vehicle_count)
+            statsd_client.increment('movilidad.vehiculos_por_comuna', value=vehicle_count)
+
     def generate_event(self, sensor_id: str) -> Dict[str, Any]:
-        """Generar un evento simulado de sensor"""
+        """Generar un evento simulado de sensor con ubicación realista."""
         sensor_type = random.choice(SENSOR_TYPES)
-        
-        base_lat = CITY_CENTER_LAT + (random.random() - 0.5) * LAT_RANGE
-        base_lng = CITY_CENTER_LNG + (random.random() - 0.5) * LNG_RANGE
-        
+        location = random.choice(LOCATIONS)
+
         event = {
             'sensor_id': sensor_id,
             'sensor_type': sensor_type,
-            'intersection': random.choice(self.intersections),
-            'latitude': round(base_lat, 6),
-            'longitude': round(base_lng, 6),
+            'intersection': location['intersection'],
+            'avenue': location['avenue'],
+            'district': location['district'],
+            'latitude': round(location['latitude'], 6),
+            'longitude': round(location['longitude'], 6),
             'vehicle_count': max(0, int(np.random.poisson(25))),
             'average_speed': round(np.random.normal(40, 15), 2),
             'traffic_density': round(random.uniform(0, 100), 2),
@@ -173,9 +243,9 @@ class EventGenerator:
             'incident_type': random.choice(INCIDENT_TYPES) if random.random() > 0.8 else 'none',
             'temperature': round(random.uniform(15, 35), 2),
             'humidity': round(random.uniform(30, 90), 2),
-            'timestamp': datetime.utcnow().isoformat() + 'Z'
+            'timestamp': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
         }
-        
+
         return event
 
     def produce_events(self):
@@ -210,6 +280,7 @@ class EventGenerator:
                                 
                                 events_produced.add(1)
                                 statsd_client.increment('events.produced')
+                                self._emit_traffic_metrics(event)
                                 
                         except Exception as e:
                             logger.error(f"Error sending event: {str(e)}")

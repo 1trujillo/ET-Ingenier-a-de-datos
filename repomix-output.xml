@@ -42,6 +42,7 @@ The content is organized as follows:
 <directory_structure>
 .env.example
 .gitignore
+check_minio.py
 DELIVERY_SUMMARY.md
 docker-compose.yml
 docs/ADR.md
@@ -85,11 +86,43 @@ streaming_worker/Dockerfile
 streaming_worker/otel_setup.py
 streaming_worker/requirements.txt
 streaming_worker/worker.py
+tmp_check.py
 VERIFICATION.md
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="check_minio.py">
+import boto3
+from botocore.config import Config
+
+s3 = boto3.client(
+    's3',
+    endpoint_url='http://localhost:9000',
+    aws_access_key_id='minioadmin',
+    aws_secret_access_key='minioadmin',
+    region_name='us-east-1',
+    config=Config(s3={'addressing_style': 'path'})
+)
+
+for bucket in ['bronze', 'silver', 'gold']:
+    try:
+        resp = s3.list_objects_v2(Bucket=bucket, MaxKeys=5)
+        keys = [c['Key'] for c in resp.get('Contents', [])]
+        print(bucket, 'count=', len(keys), 'sample=', keys[:5])
+    except Exception as e:
+        print(bucket, 'ERROR', e)
+</file>
+
+<file path="tmp_check.py">
+import ast, pathlib
+path = pathlib.Path('etl/gold_transformer.py')
+src = path.read_text(encoding='utf-8')
+print('loaded', len(src.splitlines()), 'lines')
+ast.parse(src)
+print('AST_OK')
+</file>
 
 <file path="DELIVERY_SUMMARY.md">
 # 📋 ENTREGA - MVP DATA PLATFORM
@@ -427,350 +460,6 @@ Testing: ⏳ LISTO PARA EJECUTAR
 *Versión: MVP 1.0*
 </file>
 
-<file path="docker-compose.yml">
-services:
-  # ============================================
-  # INFRAESTRUCTURA
-  # ============================================
-
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    container_name: zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_SYNC_LIMIT: 2
-      ZOOKEEPER_INIT_LIMIT: 5
-      ZK_CLIENT_PORT: 2181
-      KAFKA_BROKER_ID: 1
-    ports:
-      - "2181:2181"
-    networks:
-      - data-platform
-    healthcheck:
-      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  kafka:
-    image: confluentinc/cp-kafka:7.5.0
-    container_name: kafka
-    depends_on:
-      zookeeper:
-        condition: service_healthy
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-      KAFKA_LOG_RETENTION_HOURS: 24
-      KAFKA_COMPRESSION_TYPE: snappy
-    ports:
-      - "9092:9092"
-      - "29092:29092"
-    networks:
-      - data-platform
-    healthcheck:
-      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 10s
-      retries: 10
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  minio:
-    image: minio/minio:latest
-    container_name: minio
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio_data:/data
-    networks:
-      - data-platform
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # ============================================
-  # DATADOG AGENT
-  # ============================================
-
-  datadog-agent:
-    image: datadog/agent:latest
-    container_name: datadog-agent
-    environment:
-      DD_API_KEY: ${DD_API_KEY:-test_key_local_only}
-      DD_SITE: ${DD_SITE:-datadoghq.com}
-      DD_LOGS_ENABLED: "true"
-      DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL: "true"
-      DD_CONTAINER_EXCLUDE_LOGS: "image:datadog/agent"
-      DD_APM_ENABLED: "true"
-      DD_TRACE_SAMPLE_RATE: 1
-      DD_METRICS_LIMIT: 2000
-      DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"
-      DD_DOGSTATSD_SOCKET: /var/run/datadog/dsd.sock
-    ports:
-      - "8126:8126"
-      - "4317:4317"
-      - "4318:4318"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./monitoring/datadog-agent.yaml:/etc/datadog-agent/datadog.yaml:ro
-      - datadog_socket:/var/run/datadog
-    networks:
-      - data-platform
-    healthcheck:
-      test: ["CMD", "agent", "status"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # ============================================
-  # COMPONENTES DE DATOS
-  # ============================================
-
-  generator:
-    build:
-      context: ./generator
-      dockerfile: Dockerfile
-    container_name: data-generator
-    depends_on:
-      kafka:
-        condition: service_healthy
-      datadog-agent:
-        condition: service_healthy
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_TOPIC: raw_events
-      DD_AGENT_HOST: datadog-agent
-      DD_TRACE_AGENT_PORT: 8126
-      DD_DOGSTATSD_HOST: datadog-agent
-      DD_DOGSTATSD_PORT: 8125
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
-      OTEL_ENVIRONMENT: local
-      PYTHONUNBUFFERED: 1
-    networks:
-      - data-platform
-    volumes:
-      - datadog_socket:/var/run/datadog
-    restart: on-failure
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  streaming-worker:
-    build:
-      context: ./streaming_worker
-      dockerfile: Dockerfile
-    container_name: streaming-worker
-    depends_on:
-      kafka:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-      datadog-agent:
-        condition: service_healthy
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_TOPIC: raw_events
-      KAFKA_GROUP_ID: bronze_workers
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: bronze
-      DD_AGENT_HOST: datadog-agent
-      DD_TRACE_AGENT_PORT: 8126
-      DD_DOGSTATSD_HOST: datadog-agent
-      DD_DOGSTATSD_PORT: 8125
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
-      OTEL_ENVIRONMENT: local
-      PYTHONUNBUFFERED: 1
-    networks:
-      - data-platform
-    volumes:
-      - datadog_socket:/var/run/datadog
-    restart: on-failure
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  etl-spark:
-    build:
-      context: ./etl
-      dockerfile: Dockerfile
-    container_name: etl-spark
-    depends_on:
-      minio:
-        condition: service_healthy
-      datadog-agent:
-        condition: service_healthy
-    environment:
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET_BRONZE: bronze
-      MINIO_BUCKET_SILVER: silver
-      SPARK_LOCAL_IP: etl-spark
-      DD_AGENT_HOST: datadog-agent
-      DD_TRACE_AGENT_PORT: 8126
-      DD_DOGSTATSD_HOST: datadog-agent
-      DD_DOGSTATSD_PORT: 8125
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
-      OTEL_ENVIRONMENT: local
-      PYTHONUNBUFFERED: 1
-    networks:
-      - data-platform
-    volumes:
-      - datadog_socket:/var/run/datadog
-    restart: on-failure
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  gold-transformer:
-    build:
-      context: ./etl
-      dockerfile: Dockerfile.gold
-    container_name: gold-transformer
-    depends_on:
-      minio:
-        condition: service_healthy
-      datadog-agent:
-        condition: service_healthy
-    environment:
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET_SILVER: silver
-      MINIO_BUCKET_GOLD: gold
-      DD_AGENT_HOST: datadog-agent
-      DD_TRACE_AGENT_PORT: 8126
-      DD_DOGSTATSD_HOST: datadog-agent
-      DD_DOGSTATSD_PORT: 8125
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
-      OTEL_ENVIRONMENT: local
-      PYTHONUNBUFFERED: 1
-    networks:
-      - data-platform
-    volumes:
-      - datadog_socket:/var/run/datadog
-    restart: on-failure
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # ============================================
-  # API Y APLICACIONES
-  # ============================================
-
-  fastapi:
-    build:
-      context: ./fastapi_service
-      dockerfile: Dockerfile
-    container_name: fastapi-server
-    depends_on:
-      minio:
-        condition: service_healthy
-      datadog-agent:
-        condition: service_healthy
-    environment:
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET_GOLD: gold
-      DD_AGENT_HOST: datadog-agent
-      DD_TRACE_AGENT_PORT: 8126
-      DD_DOGSTATSD_HOST: datadog-agent
-      DD_DOGSTATSD_PORT: 8125
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
-      OTEL_ENVIRONMENT: local
-      PYTHONUNBUFFERED: 1
-    ports:
-      - "8000:8000"
-    networks:
-      - data-platform
-    volumes:
-      - datadog_socket:/var/run/datadog
-    restart: on-failure
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # ============================================
-  # MONITOREO Y LOGGING
-  # ============================================
-
-  nginx:
-    image: nginx:alpine
-    container_name: nginx-proxy
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./monitoring/nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      - fastapi
-      - minio
-    networks:
-      - data-platform
-    healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-networks:
-  data-platform:
-    driver: bridge
-
-volumes:
-  minio_data:
-  datadog_socket:
-</file>
-
 <file path="docs/ADR.md">
 # Architecture Decision Records (ADR)
 
@@ -1096,424 +785,6 @@ Usar **Nginx** como proxy.
 7. **Data Quality** (Great Expectations vs dbt tests)
 </file>
 
-<file path="docs/ARCHITECTURE.md">
-# Arquitectura del Data Platform
-
-## Visión General
-
-La plataforma sigue la arquitectura **Medallion** (también conocida como Lakehouse Architecture), que divide el procesamiento de datos en tres capas lógicas:
-
-## 1. Bronze Layer (Raw Data)
-
-### Propósito
-Almacenar datos crudos tal como llegan del sistema fuente.
-
-### Características
-- **Ingesta**: Kafka Streaming
-- **Almacenamiento**: MinIO (S3-compatible)
-- **Formato**: JSON
-- **Particionamiento**: Por fecha y hora
-- **Retención**: 24 horas (configurable)
-
-### Estructura
-```
-s3://bronze/
-└── raw/
-    └── date=2024-01-15/
-        └── hour=10/
-            └── 1705330245000.json
-            └── 1705330245001.json
-            ...
-```
-
-### Flujo
-```
-Generador de Datos
-    ↓ (Kafka)
-Kafka Topic "raw_events"
-    ↓ (Consumer Group: bronze_workers)
-Streaming Worker
-    ↓ (Batch)
-MinIO S3 (bronze)
-```
-
-## 2. Silver Layer (Cleansed & Enriched)
-
-### Propósito
-Datos limpios, validados, normalizados y enriquecidos.
-
-### Características
-- **Procesamiento**: Apache Spark
-- **Almacenamiento**: MinIO (S3-compatible)
-- **Formato**: Parquet (columnar)
-- **Particionamiento**: year/month/day/hour
-- **Intervalo de actualización**: 5 minutos
-- **Retención**: 30 días
-
-### Transformaciones
-
-#### Validación
-- Campos requeridos no nulos
-- Rangos válidos:
-  - Latitude: [-90, 90]
-  - Longitude: [-180, 180]
-  - Vehicle count: >= 0
-  - Speed: [0, 200]
-  - Air Quality: [0, 500]
-
-#### Limpieza
-- Trimming de strings
-- Lowercase de IDs
-- Eliminación de duplicados
-
-#### Enriquecimiento
-```python
-# Clasificación de tráfico
-traffic_level = case(
-    when(traffic_density < 25, "low"),
-    when(traffic_density < 60, "medium"),
-    when(traffic_density < 85, "high"),
-    else="critical"
-)
-
-# Clasificación de calidad del aire
-air_quality_level = case(
-    when(aqi < 50, "good"),
-    when(aqi < 100, "moderate"),
-    when(aqi < 150, "unhealthy_for_groups"),
-    when(aqi < 200, "unhealthy"),
-    else="hazardous"
-)
-
-# Extracción de componentes de timestamp
-year, month, day, hour = extract_date_components(timestamp)
-```
-
-### Estructura
-```
-s3://silver/
-└── processed/
-    └── year=2024/
-        └── month=01/
-            └── day=15/
-                └── hour=10/
-                    └── part-00000.parquet
-                    └── part-00001.parquet
-```
-
-### Esquema
-
-```python
-StructType([
-    StructField("sensor_id", StringType()),
-    StructField("sensor_type", StringType()),
-    StructField("latitude", DoubleType()),
-    StructField("longitude", DoubleType()),
-    StructField("timestamp", TimestampType()),
-    StructField("vehicle_count", IntegerType()),
-    StructField("average_speed", DoubleType()),
-    StructField("traffic_density", DoubleType()),
-    StructField("air_quality_index", DoubleType()),
-    StructField("traffic_level", StringType()),  # Enriquecido
-    StructField("air_quality_level", StringType()),  # Enriquecido
-    StructField("year", IntegerType()),  # Particionado
-    StructField("month", IntegerType()),  # Particionado
-    StructField("day", IntegerType()),  # Particionado
-    StructField("hour", IntegerType()),  # Particionado
-])
-```
-
-## 3. Gold Layer (Business Ready)
-
-### Propósito
-Datos ya procesados, listos para consultas y análisis.
-
-### Características
-- **Procesamiento**: Agregaciones y transformaciones (Gold Transformer)
-- **Almacenamiento**: MinIO (S3-compatible)
-- **Formato**: JSON
-- **Intervalo de actualización**: 10 minutos
-- **Acceso**: REST API con FastAPI
-
-### Estructura en MinIO
-```
-s3://gold/
-├── hourly_metrics/
-│   └── date=2024-01-15/
-│       └── 1705330245000.json
-└── incident_reports/
-    └── date=2024-01-15/
-        └── 1705330245001.json
-```
-
-### Entidades
-
-#### Hourly Metrics
-Agregados por hora de cada tipo de sensor.
-
-```json
-{
-  "timestamp": "2024-01-15T10:00:00",
-  "year": 2024,
-  "month": 1,
-  "day": 15,
-  "hour": 10,
-  "sensor_type": "traffic",
-  "metrics": {
-    "avg_speed": 42.5,
-    "max_speed": 85.3,
-    "min_speed": 15.2,
-    "avg_density": 58.3,
-    "max_density": 95.0,
-    "records_count": 150
-  },
-  "record_count": 150
-}
-```
-
-#### Incident Reports
-Reportes de incidentes detectados.
-
-```json
-{
-  "timestamp": "2024-01-15T10:15:30",
-  "sensor_id": "SENSOR_0042",
-  "sensor_type": "traffic",
-  "incident_type": "accident",
-  "location": {
-    "latitude": -12.0456,
-    "longitude": -77.0365
-  },
-  "intersection": "INT_0042"
-}
-```
-
-## Componentes de Sistema
-
-### 1. Data Generator
-
-**Responsabilidad**: Simular sensores IoT
-
-**Especificaciones**:
-- 100 sensores simultáneos
-- Eventos cada 2 segundos (batch de 50)
-- Variación realista de datos
-- Geolocalización simulada en Lima
-
-**Producción de Eventos**:
-- Rate: ~25 eventos/segundo
-- Formato: JSON
-- Canal: Kafka
-
-### 2. Kafka
-
-**Cluster**:
-- Brokers: 1
-- Topics: 1 (raw_events)
-- Particiones: 1
-- Replication Factor: 1
-
-**Configuración**:
-- Retention: 24 horas
-- Compression: snappy
-- Serialization: JSON
-
-### 3. Streaming Worker
-
-**Responsabilidad**: Consumir de Kafka y escribir en Bronze
-
-**Características**:
-- Consumer Group: bronze_workers
-- Poll Size: 100 mensajes
-- Commit: Auto
-- Particionamiento: Por fecha/hora
-
-**Performance**:
-- Latencia esperada: < 100ms
-
-### 4. Spark ETL
-
-**Configuración**:
-- Master: local[*]
-- Memory: 2GB (configurable)
-- Shuffle Partitions: 4 (configurable)
-- Execution Mode: local
-
-**Procesamiento**:
-- Input: MinIO Bronze (JSON)
-- Output: MinIO Silver (Parquet)
-- Intervalo: 5 minutos
-
-**Optimizaciones**:
-- Predicate pushdown
-- Column pruning
-- Broadcast joins
-
-### 5. Gold Transformer
-
-**Responsabilidad**: Transformar Silver a Gold
-
-**Agregaciones**:
-- Hourly metrics por sensor_type
-- Detección de incidentes
-- Estadísticas de locación
-
-**Almacenamiento**: MinIO Gold (JSON)
-**Formato**: JSON particionado por fecha
-**Intervalo**: 10 minutos
-
-### 6. FastAPI
-
-**Endpoints**:
-- GET /health - Health check
-- GET /readiness - Readiness check
-- GET /api/v1/metrics/hourly - Métricas por hora
-- GET /api/v1/incidents - Reportes de incidentes
-- GET /api/v1/aggregations/by-sensor-type - Agregaciones
-- GET /api/v1/stats/database - Estadísticas
-
-**Almacenamiento**: Lee desde MinIO Gold layer (S3 API)
-
-**Rate Limiting**: No implementado (MVP)
-
-**Authentication**: No implementada (MVP)
-
-## Flujos de Datos
-
-### Ingesta
-
-```
-Generador
-  ↓
-Kafka (raw_events)
-  ↓ Streaming Worker
-MinIO Bronze
-  ↓ ~100-200 eventos/segundo
-~8.6M eventos/día
-```
-
-### Procesamiento ETL
-
-```
-MinIO Bronze (cada 5 min)
-  ↓
-Spark Local
-  - Validación
-  - Limpieza
-  - Enriquecimiento
-  - Particionamiento
-  ↓
-MinIO Silver (Parquet)
-```
-
-### Agregación (Gold)
-
-```
-MinIO Silver (cada 10 min)
-  ↓
-Gold Transformer
-  - Agregación por hora
-  - Detección de incidentes
-  ↓
-MinIO Gold (JSON)
-  - hourly_metrics/
-  - incident_reports/
-```
-
-### Exposición
-
-```
-MinIO Gold (S3 API)
-  ↓
-FastAPI (boto3 S3 client)
-  ↓ JSON REST API
-Nginx Proxy
-  ↓
-Consumidores (Datadog, Dashboards, etc)
-```
-
-## Observabilidad
-
-### Puntos de Instrumentación
-
-1. **Generator**
-   - Events produced
-   - Production latency
-   - Kafka connection status
-
-2. **Streaming Worker**
-   - Messages consumed
-   - Messages stored
-   - Consumer lag
-   - Processing latency
-
-3. **ETL**
-   - Pipeline duration
-   - Records processed
-   - Invalid records
-   - S3 I/O metrics
-
-4. **Gold Transformer**
-   - Transformation runs
-   - Documents created
-   - MinIO I/O metrics
-
-5. **FastAPI**
-   - Requests total
-   - Request duration
-   - Endpoint-specific metrics
-
-### Métricas del Sistema
-
-- CPU usage por container
-- Memory usage por container
-- Disk usage
-- Network I/O
-- Container restart count
-
-## Decisiones Arquitectónicas
-
-1. **Medallion Architecture**: Separación clara de capas
-2. **Local Deployment**: Facilita desarrollo y testing
-3. **Parquet en Silver**: Compresión y velocidad
-4. **MinIO para todas las capas (Bronze, Silver, Gold)**: Simplifica la infraestructura, eliminando MongoDB
-5. **JSON en Gold**: Formato portable y legible para la API
-6. **OpenTelemetry + DogStatsD**: Estándar abierto + Datadog
-7. **Spark Local**: Suficiente para MVP, scalable a cluster
-
-## Consideraciones de Escala
-
-### Bottlenecks Identificados
-
-1. **Kafka Single Broker**: Limita throughput
-2. **Spark Local**: Limita procesamiento
-3. **MinIO Single Node**: Sin replicación
-
-### Mejoras Futuras
-
-1. Kafka Multi-broker cluster
-2. Spark Cluster mode (YARN/K8s)
-3. MinIO Distributed mode
-4. Caching layer (Redis)
-5. Data Lake indexing optimization
-
-## Seguridad
-
-### MVP (Minimal)
-
-- Credenciales en variables de entorno
-- No hay encriptación en tránsito (local)
-- No hay autenticación en APIs
-
-### Consideraciones Futuras
-
-- API keys y JWT
-- Encriptación TLS
-- Network segmentation
-- Audit logging
-- Bucket policies en MinIO
-</file>
-
 <file path="docs/Datadog.md">
 # Datadog Setup Guide
 
@@ -1581,6 +852,9 @@ Enviadas por cada servicio:
 generator.events_produced
 generator.events_failed
 generator.production_latency_ms
+movilidad.vehiculos_por_minuto
+movilidad.vehiculos_por_avenida
+movilidad.vehiculos_por_comuna
 ```
 
 ### Streaming Worker
@@ -1636,6 +910,18 @@ Type: Timeseries
 Widget 4: Documents Created
 Query: sum:gold_transformer.documents_created{}.as_count()
 Type: Timeseries
+
+Widget 5: Vehículos por minuto
+Query: sum:movilidad.vehiculos_por_minuto{}.as_count()
+Type: Timeseries
+
+Widget 6: Vehículos por avenida
+Query: sum:movilidad.vehiculos_por_avenida{} by {avenue}
+Type: Top List
+
+Widget 7: Vehículos por comuna
+Query: sum:movilidad.vehiculos_por_comuna{} by {district}
+Type: Top List
 ```
 
 ### Dashboard: Infrastructure
@@ -1770,285 +1056,6 @@ docker compose logs generator | grep "events_produced"
 - [Datadog Agent Docs](https://docs.datadoghq.com/agent/)
 - [OpenTelemetry Exporter](https://docs.datadoghq.com/opentelemetry/)
 - [DogStatsD](https://docs.datadoghq.com/developers/dogstatsd/)
-</file>
-
-<file path="docs/Medallion.md">
-# Arquitectura Medallion
-
-## ¿Qué es Medallion?
-
-La arquitectura Medallion (también llamada "Lakehouse Architecture" o "Delta Lake Architecture") es un patrón de arquitectura de datos que organiza datos en capas de creciente calidad y complejidad.
-
-## Niveles
-
-### 1. Bronze Level (Raw)
-
-La capa bruta contiene datos tal como se reciben de los sistemas fuente.
-
-**Características**:
-- Sin transformaciones
-- Sin validaciones
-- Sin enriquecimiento
-- Datos históricos sin cambios
-
-**Ventajas**:
-- Fácil ingesta
-- Recuperación de datos originales
-- Auditabilidad completa
-- Sin pérdida de información
-
-**Nuestro Caso**:
-```
-Formato: JSON
-Fuente: Kafka
-Almacenamiento: MinIO S3
-Particionamiento: date/hour
-Tamaño: ~750 MB/día
-Retención: 24 horas
-```
-
-### 2. Silver Level (Cleansed)
-
-La capa procesada contiene datos limpios y validados.
-
-**Transformaciones**:
-- Validación de esquema
-- Limpieza de datos
-- Normalización
-- Eliminación de duplicados
-- Enriquecimiento
-
-**Ventajas**:
-- Datos listos para análisis
-- Mejor performance (Parquet)
-- Consistencia garantizada
-- Auditoría de calidad
-
-**Nuestro Caso**:
-```
-Formato: Parquet
-Procesador: Apache Spark
-Almacenamiento: MinIO S3
-Particionamiento: year/month/day/hour
-Tamaño: ~375 MB/día (50% reducción)
-Retención: 30 días
-```
-
-### 3. Gold Level (Curated)
-
-La capa curada contiene datos específicos del negocio, listos para consumo.
-
-**Características**:
-- Agregaciones
-- Métricas de negocio
-- KPIs
-- Dimensiones normalizadas
-
-**Ventajas**:
-- Rendimiento óptimo
-- Sem ántica de negocio clara
-- Acceso simplificado
-- Independencia de fuente
-
-**Nuestro Caso**:
-```
-Formato: JSON
-Procesador: Gold Transformer (Python)
-Almacenamiento: MinIO (gold bucket)
-Particionamiento: date=YYYY-MM-DD
-Tipos de Datos:
-  - hourly_metrics/
-  - incident_reports/
-Retención: Indefinida
-```
-
-## Flujo de Datos
-
-### Timeline Ejemplo
-
-```
-T+0:     Evento generado
-T+50ms:  Evento en Kafka
-T+100ms: Evento en Bronze (JSON)
-T+5min:  Lote en Bronze listo para procesar
-T+7min:  Datos en Silver (Parquet)
-T+10min: Agregaciones calculadas
-T+12min: Datos en Gold (MinIO JSON)
-T+13min: Disponible en API
-```
-
-### Volúmenes
-
-```
-Entrada (Bronze):        2.16M eventos/día
-Después Validación:      2.05M eventos/día (95% válidos)
-Silver (Parquet):        2.05M registros
-Gold (Hourly Metrics):   120 documentos/día
-Gold (Incidents):        21.6K documentos/día
-```
-
-## Ventajas de Medallion
-
-### 1. Escalabilidad
-- Datos crudos en Bronze facilitan la ingesta
-- Capa Silver permite procesamiento eficiente
-- Gold proporciona acceso rápido
-
-### 2. Flexibilidad
-- Agregar nuevas fuentes en Bronze
-- Nuevas transformaciones en Silver
-- Nuevos casos de uso en Gold
-
-### 3. Calidad de Datos
-- Cada capa valida y mejora
-- Trazabilidad completa
-- Recuperación de errores posible
-
-### 4. Seguridad
-- Control de acceso por capa
-- Auditoría de cambios
-- Preservación de datos originales
-
-### 5. Costo
-- Compresión en Silver/Gold
-- Retención flexible
-- Almacenamiento eficiente
-
-## Versioning y Time Travel
-
-Una ventaja adicional del Parquet + particionamiento:
-
-### Silver
-
-```
-s3://silver/processed/year=2024/month=01/day=15/hour=10/
-s3://silver/processed/year=2024/month=01/day=15/hour=11/
-s3://silver/processed/year=2024/month=01/day=16/hour=10/
-```
-
-Cualquier análisis puede referenciar datos de momentos específicos.
-
-### Gold
-
-Con particionamiento por fecha en MinIO, el versionamiento es implícito:
-
-```
-s3://gold/hourly_metrics/date=2024-01-15/
-s3://gold/hourly_metrics/date=2024-01-16/
-```
-
-Cada ejecución del Gold Transformer produce archivos nuevos que pueden ser consumidos por la API.
-
-## Casos de Uso
-
-### 1. Debugging
-```
-¿Datos incorrectos en API?
-1. Ver documento en Gold
-2. Buscar en Silver (Parquet)
-3. Validar en Bronze (JSON original)
-```
-
-### 2. Auditoría
-```
-¿Quién accedió qué dato?
-1. Logs en Bronze
-2. Transformaciones en Silver
-3. Acceso en Gold
-```
-
-### 3. Machine Learning
-```
-1. Bronze: Raw features
-2. Silver: Engineered features
-3. Gold: ML-ready datasets
-```
-
-### 4. Business Intelligence
-```
-1. Bronze: Event logs
-2. Silver: Normalized facts
-3. Gold: Dimensions + Measures
-```
-
-## Antipatrones a Evitar
-
-### 1. Saltarse Bronze
-❌ Enviar datos directamente a Silver
-✓ Siempre preservar originales en Bronze
-
-### 2. Bronze como Data Warehouse
-❌ Intentar consultar Bronze directamente
-✓ Usar Gold para consultas
-
-### 3. Sin Validación en Silver
-❌ Copiar datos sin validar
-✓ Aplicar reglas de calidad
-
-### 4. Gold sin Particionamiento
-❌ Datos Gold sin particionar
-✓ Particionar por fecha para consultas eficientes
-
-## Monitoreo de Medallion
-
-### Métricas Importantes
-
-| Métrica | Ideal | Alerta |
-|---------|-------|--------|
-| Bronze → Silver Lag | <5 min | >15 min |
-| Silver → Gold Lag | <10 min | >20 min |
-| Silver Válidos | >95% | <90% |
-| Gold Queries P95 | <200ms | >1000ms |
-
-### Queries de Monitoreo
-
-```python
-# Tamaño por capa
-SELECT 
-  'bronze' as layer,
-  COUNT(*) as records,
-  SUM(file_size) as total_size
-FROM bronze_events
-
-# Calidad
-SELECT
-  COUNT(CASE WHEN is_valid THEN 1 END) as valid,
-  COUNT(*) as total,
-  ROUND(100.0 * COUNT(CASE WHEN is_valid THEN 1 END) / COUNT(*), 2) as pct_valid
-FROM silver_events
-
-# Performance
-SELECT
-  'hourly_metrics' as collection,
-  COUNT(*) as documents,
-  ROUND(AVG(query_time_ms), 2) as avg_query_ms
-FROM gold_queries
-```
-
-## Evolución Futura
-
-### Fase 1 (Actual)
-- Bronze: JSON en MinIO
-- Silver: Parquet en MinIO
-- Gold: JSON en MinIO
-- API: FastAPI leyendo desde MinIO Gold (sin MongoDB)
-
-### Fase 2 (Próxima)
-- Agregar Delta Lake
-- Versioning automático
-- ACID guarantees
-- Time travel
-
-### Fase 3
-- Multicloud (Bronze in AWS S3, Silver in Azure, Gold in GCP)
-- Real-time Bronze (Kafka → Bronze sin batching)
-- ML Feature Store
-
-## Referencias
-
-- [Databricks Lakehouse](https://databricks.com/blog/2021/08/30/frequently-asked-questions-about-the-databricks-lakehouse.html)
-- [Gartner Modern Data Architecture](https://www.gartner.com/en/documents/3981889)
-- [Delta Lake](https://delta.io/)
 </file>
 
 <file path="docs/Observability.md">
@@ -2457,471 +1464,6 @@ docker compose exec mongodb mongosh \
 6. **Forecasting**: Predicción de recursos
 </file>
 
-<file path="docs/Pipeline.md">
-# Pipeline de Datos Detallado
-
-## Visión General
-
-Este documento describe el flujo detallado de datos desde su generación hasta su exposición.
-
-## 1. Generación de Datos (Generator)
-
-### Ciclo de Generación
-
-```python
-while True:
-    for i in range(BATCH_SIZE):
-        # Seleccionar sensor aleatorio
-        sensor_id = random.choice(sensor_ids)
-        
-        # Generar evento
-        event = {
-            'sensor_id': sensor_id,
-            'sensor_type': random.choice(SENSOR_TYPES),
-            'latitude': base_lat + variation,
-            'longitude': base_lng + variation,
-            'vehicle_count': random.poisson(25),
-            'average_speed': random.normal(40, 15),
-            'traffic_density': uniform(0, 100),
-            'air_quality_index': uniform(0, 500),
-            'incident_detected': random.choice([True, False]),
-            'timestamp': datetime.utcnow().isoformat()
-        }
-        
-        # Enviar a Kafka
-        producer.send('raw_events', value=event)
-    
-    time.sleep(INTERVAL_SECONDS)
-```
-
-### Parametros
-
-- **NUM_SENSORS**: 100 sensores simultáneos
-- **BATCH_SIZE**: 50 eventos por batch
-- **INTERVAL_SECONDS**: 2 segundos entre batches
-- **Throughput**: ~25 eventos/segundo = ~2.16M eventos/día
-
-### Simulación de Datos
-
-```
-Lima: -12.0462, -77.0371
-
-Variación de coordenadas:
-  lat ±0.05 (aprox 5.5 km)
-  lng ±0.05 (aprox 5.5 km)
-
-Valores simulados:
-  vehicle_count: Poisson(λ=25)
-  average_speed: Normal(μ=40, σ=15)
-  traffic_density: Uniform(0, 100)
-  air_quality_index: Uniform(0, 500)
-  incident_detected: Bernoulli(p=0.05)
-```
-
-## 2. Kafka Topic
-
-### Configuración
-
-```yaml
-topic: raw_events
-partitions: 1
-replication_factor: 1
-retention_ms: 86400000  # 24 horas
-compression: snappy
-```
-
-### Estructura del Mensaje
-
-```json
-{
-  "key": null,
-  "value": {
-    "sensor_id": "SENSOR_0042",
-    "sensor_type": "traffic",
-    "intersection": "INT_0023",
-    "latitude": -12.0456,
-    "longitude": -77.0365,
-    "vehicle_count": 28,
-    "average_speed": 42.5,
-    "traffic_density": 65.3,
-    "traffic_light_status": "green",
-    "air_quality_index": 125,
-    "noise_level": 72.5,
-    "incident_detected": false,
-    "incident_type": "none",
-    "temperature": 24.5,
-    "humidity": 68.0,
-    "timestamp": "2024-01-15T10:30:45Z"
-  },
-  "timestamp": 1705330245000,
-  "offset": 12345,
-  "partition": 0
-}
-```
-
-### Consumo
-
-```yaml
-group_id: bronze_workers
-auto_offset_reset: earliest
-enable_auto_commit: true
-max_poll_records: 100
-session_timeout_ms: 30000
-```
-
-## 3. Bronze Layer - Streaming
-
-### Flujo de Escritura
-
-```
-Kafka Consumer
-    ↓ (Batch de 100 registros)
-JSON Serialization
-    ↓
-Partitioned Path Generation
-    date=2024-01-15/hour=10/
-    ↓
-MinIO Put Object
-    s3://bronze/raw/date=2024-01-15/hour=10/1705330245000.json
-```
-
-### Estructura de Almacenamiento
-
-```
-s3://bronze/
-└── raw/
-    └── date=2024-01-15/
-        └── hour=00/
-            ├── 1705283904000.json
-            ├── 1705283905000.json
-            └── ...
-        └── hour=01/
-            └── ...
-        └── ...
-        └── hour=23/
-            └── ...
-```
-
-### Tamaño de Datos
-
-```
-Eventos/día: 2.16M
-Tamaño por evento: ~350 bytes
-Total/día: 756 MB
-
-Retención 24h: 756 MB
-```
-
-### Latencia
-
-- Generación → Kafka: ~5ms
-- Kafka → Consumer: ~10ms
-- Batch → MinIO: ~50ms
-- **Total: ~65ms (P95)**
-
-## 4. ETL - Silver Layer
-
-### Scheduling
-
-```
-Cada 5 minutos:
-1. Leer Bronze (últimos 5 min)
-2. Validar
-3. Enriquecer
-4. Escribir Silver
-```
-
-### Procesamiento Detallado
-
-#### Validación
-
-```python
-# 1. Campos requeridos no nulos
-df = df.filter(
-    col('sensor_id').isNotNull() &
-    col('latitude').isNotNull() &
-    ...
-)
-
-# 2. Rangos válidos
-df = df.filter(
-    (col('latitude') >= -90) & (col('latitude') <= 90) &
-    (col('longitude') >= -180) & (col('longitude') <= 180) &
-    (col('vehicle_count') >= 0) &
-    ...
-)
-```
-
-#### Enriquecimiento
-
-```python
-# Clasificar tráfico
-df = df.withColumn(
-    'traffic_level',
-    when(col('traffic_density') < 25, 'low')
-    .when(col('traffic_density') < 60, 'medium')
-    .when(col('traffic_density') < 85, 'high')
-    .otherwise('critical')
-)
-
-# Extraer componentes de fecha
-df = df.withColumn('year', year(col('timestamp')))
-df = df.withColumn('month', month(col('timestamp')))
-df = df.withColumn('day', dayofmonth(col('timestamp')))
-df = df.withColumn('hour', hour(col('timestamp')))
-```
-
-#### Escritura
-
-```python
-df.write \
-    .mode("append") \
-    .partitionBy("year", "month", "day", "hour") \
-    .parquet(f"s3a://{bucket}/processed/")
-```
-
-### Estructura de Salida
-
-```
-s3://silver/
-└── processed/
-    └── year=2024/
-        └── month=01/
-            └── day=15/
-                └── hour=10/
-                    ├── part-00000.parquet
-                    ├── part-00001.parquet
-                    └── _SUCCESS
-```
-
-### Estadísticas
-
-```
-Entrada: 50,000 eventos (5 min)
-Validación: 95% válidos (47,500)
-Enriquecimiento: +8 columnas
-Salida: 47,500 registros
-Formato: Parquet (snappy compression)
-Tamaño: ~35 MB (50% reducción vs JSON)
-Duración: ~2 minutos
-Latencia: 5 min desde generación
-```
-
-## 5. Gold Layer - Transformación
-
-### Scheduling
-
-```
-Cada 10 minutos:
-1. Leer Silver (últimos 10 min)
-2. Agregaciones por hora
-3. Detección de incidentes
-4. Escribir en MinIO Gold (JSON)
-```
-
-### Agregaciones
-
-#### Hourly Metrics
-
-```python
-# Agrupar por hora y sensor_type
-aggregates = df.groupBy(
-    'year', 'month', 'day', 'hour', 'sensor_type'
-).agg(
-    avg('average_speed').alias('avg_speed'),
-    max('average_speed').alias('max_speed'),
-    avg('traffic_density').alias('avg_density'),
-    count('*').alias('record_count')
-)
-```
-
-#### Incident Reports
-
-```python
-# Filtrar incidentes
-incidents = df.filter(col('incident_detected') == True).select(
-    'timestamp',
-    'sensor_id',
-    'sensor_type',
-    'incident_type',
-    'latitude',
-    'longitude',
-    'intersection'
-)
-```
-
-### Resultados
-
-```
-Hourly Metrics (MinIO gold/hourly_metrics/):
-  100-200 métricas por 10 minutos
-
-Incident Reports (MinIO gold/incident_reports/):
-  5-10 reportes por 10 minutos
-  (1% de eventos son incidentes)
-```
-
-## 6. Gold Layer - Exposición
-
-### Endpoints FastAPI
-
-#### GET /api/v1/metrics/hourly
-
-```bash
-curl "http://localhost/api/v1/metrics/hourly?sensor_type=traffic&hours=24&limit=1000"
-
-Response:
-[
-  {
-    "timestamp": "2024-01-15T10:00:00",
-    "sensor_type": "traffic",
-    "metrics": {
-      "avg_speed": 42.5,
-      "max_speed": 85.3,
-      "avg_density": 58.3
-    },
-    "record_count": 150
-  },
-  ...
-]
-```
-
-#### GET /api/v1/incidents
-
-```bash
-curl "http://localhost/api/v1/incidents?incident_type=accident&hours=24"
-
-Response:
-[
-  {
-    "timestamp": "2024-01-15T10:15:30Z",
-    "sensor_id": "SENSOR_0042",
-    "incident_type": "accident",
-    "location": {
-      "latitude": -12.0456,
-      "longitude": -77.0365
-    }
-  },
-  ...
-]
-```
-
-### Latencia
-
-- API Request: ~50ms
-- MinIO Gold Read: ~30ms
-- Serialización JSON: ~10ms
-- Nginx Proxy: ~5ms
-- **Total: ~95ms (P95)**
-
-## 7. Flujo Completo End-to-End
-
-### Timeline Ejemplo
-
-```
-T+0s:    Generador crea 50 eventos
-T+5ms:   Eventos en Kafka
-T+50ms:  Eventos en Bronze MinIO
-T+5min:  ETL procesa batch
-T+7min:  Datos en Silver MinIO
-T+10min: Gold Transformer agrega
-T+12min: Datos en Gold MinIO
-T+12.5min: API expone datos
-T+13min: Consulta desde cliente
-
-Latencia Total: 13 minutos
-```
-
-### Volumen Acumulativo
-
-```
-Hora 0-1:   216,000 eventos → 204,000 en Silver (94% valid)
-Hora 1-2:   216,000 eventos → 204,000 en Silver
-...
-Día 1:      5,184,000 eventos → 4,900,000 en Silver
-
-Agregados Gold:
-  Hourly Metrics: 24 * 5 tipos sensores = 120 documentos
-  Incident Reports: 5,184,000 * 0.01 = 51,840 reportes
-```
-
-## 8. Optimizaciones del Pipeline
-
-### Caching
-
-```python
-# Cache Silver datos en memoria (próxima versión)
-df.cache()
-
-# Cache MongoDB queries
-db.hourly_metrics.createIndex(
-    { "timestamp": -1, "sensor_type": 1 }
-)
-```
-
-### Particionamiento
-
-```
-Bronze:  date/hour (24 particiones/día)
-Silver:  year/month/day/hour (8760 particiones/año)
-Gold:    Por tipo de agregación
-```
-
-### Compresión
-
-```
-JSON → Snappy: 350 bytes → 180 bytes (49%)
-Parquet + Snappy: 180 bytes → 90 bytes (49%)
-```
-
-## 9. Backpressure y Resiliencia
-
-### Generator → Kafka
-
-```python
-future = producer.send(event)
-future.get(timeout=5)  # Bloqueante hasta confirmación
-```
-
-### Kafka → Bronze
-
-```python
-# Auto-commit cada 100 mensajes
-# Si falla, se reintenta desde último offset
-enable_auto_commit=True
-```
-
-### Silver → Gold
-
-```python
-# Si transformación falla, se registra
-# Próximo job lo reintenta
-```
-
-## 10. Monitoreo del Pipeline
-
-### Métricas Clave
-
-| Métrica | Objetivo | Alerta |
-|---------|----------|--------|
-| Generator Rate | >25 e/s | <20 e/s |
-| Consumer Lag | <1000 | >5000 |
-| ETL Duration | <3min | >5min |
-| Silver Records | >45k/5min | <40k/5min |
-| Gold Latency | <10min | >15min |
-| API P95 | <200ms | >500ms |
-
-### Logs Importantes
-
-```
-[Generator] Batch produced: 50 events in 25ms
-[Worker] Batch produced: stored 50 events in 45ms
-[ETL] ETL completed in 120 seconds
-[Gold] Inserted 250 hourly metrics
-[API] GET /metrics/hourly - 200 OK - 85ms
-```
-</file>
-
 <file path="docs/Testing.md">
 # Testing Guide
 
@@ -3162,714 +1704,6 @@ COPY . .
 CMD ["python", "gold_transformer.py"]
 </file>
 
-<file path="etl/etl_spark.py">
-import json
-import logging
-import os
-import time
-from datetime import datetime, timedelta
-from typing import Optional
-
-import boto3
-from pyspark.sql import SparkSession, Window
-from pyspark.sql.functions import (
-    col, when, round as spark_round, lower, trim, coalesce,
-    year, month, dayofmonth, hour, avg, max as spark_max, min as spark_min,
-    row_number, first, last, count, sum as spark_sum
-)
-from opentelemetry import metrics, trace
-
-try:
-    from statsd import StatsClient as _StatsClient
-except Exception:
-    try:
-        from statsd.client import StatsClient as _StatsClient
-    except Exception:
-        _StatsClient = None
-
-from otel_setup import configure_observability
-
-
-class _NoOpStatsClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def increment(self, *args, **kwargs):
-        return None
-
-    def gauge(self, *args, **kwargs):
-        return None
-
-    def histogram(self, *args, **kwargs):
-        return None
-
-
-def _build_statsd_client(prefix: str):
-    if _StatsClient is None:
-        return _NoOpStatsClient()
-
-    try:
-        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
-    except Exception:
-        return _NoOpStatsClient()
-
-# ============================================
-# LOGGING
-# ============================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# ============================================
-# OBSERVABILIDAD
-# ============================================
-
-meter, tracer, _ = configure_observability("etl-spark")
-
-statsd_client = _build_statsd_client('etl_spark')
-
-# ============================================
-# MÉTRICAS
-# ============================================
-
-etl_runs = meter.create_counter(
-    name="etl_runs",
-    description="Total ETL runs",
-    unit="1"
-)
-
-records_processed = meter.create_counter(
-    name="records_processed",
-    description="Total records processed",
-    unit="1"
-)
-
-records_invalid = meter.create_counter(
-    name="records_invalid",
-    description="Total invalid records",
-    unit="1"
-)
-
-etl_duration = meter.create_histogram(
-    name="etl_duration_seconds",
-    description="ETL execution duration",
-    unit="s"
-)
-
-# ============================================
-# CONFIGURACIÓN
-# ============================================
-
-MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', 'minio:9000')
-MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
-MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
-MINIO_BUCKET_BRONZE = os.getenv('MINIO_BUCKET_BRONZE', 'bronze')
-MINIO_BUCKET_SILVER = os.getenv('MINIO_BUCKET_SILVER', 'silver')
-
-# ============================================
-# SPARK SESSION
-# ============================================
-
-class SparkETL:
-    def __init__(self):
-        self.spark = self._create_spark_session()
-        self.s3_client = self._create_s3_client()
-
-    def _create_spark_session(self) -> SparkSession:
-        """Crear Spark session"""
-        return SparkSession.builder \
-            .appName("DataPlatformETL") \
-            .master("local[*]") \
-            .config("spark.hadoop.fs.s3a.endpoint", f"http://{MINIO_ENDPOINT}") \
-            .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY) \
-            .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY) \
-            .config("spark.hadoop.fs.s3a.path.style.access", "true") \
-            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
-            .config("spark.jars.packages", 
-                   "org.apache.hadoop:hadoop-aws:3.3.4,"
-                   "com.amazonaws:aws-java-sdk-bundle:1.12.261") \
-            .getOrCreate()
-
-    def _create_s3_client(self):
-        """Crear cliente S3 para MinIO"""
-        return boto3.client(
-            's3',
-            endpoint_url=f'http://{MINIO_ENDPOINT}',
-            aws_access_key_id=MINIO_ACCESS_KEY,
-            aws_secret_access_key=MINIO_SECRET_KEY,
-            region_name='us-east-1'
-        )
-
-    def _ensure_bucket_exists(self, bucket: str):
-        """Crear bucket si no existe"""
-        try:
-            self.s3_client.head_bucket(Bucket=bucket)
-        except Exception:
-            self.s3_client.create_bucket(Bucket=bucket)
-
-    def load_bronze_data(self) -> Optional[object]:
-        """Cargar datos de Bronze"""
-        try:
-            with tracer.start_as_current_span("load_bronze"):
-                bronze_path = f"s3a://{MINIO_BUCKET_BRONZE}/raw/"
-                
-                df = self.spark.read.json(bronze_path)
-                
-                if df.count() == 0:
-                    logger.warning("No data found in Bronze layer")
-                    return None
-                
-                logger.info(f"Loaded {df.count()} records from Bronze")
-                records_processed.add(df.count())
-                return df
-        except Exception as e:
-            logger.error(f"Error loading Bronze data: {str(e)}")
-            return None
-
-    def validate_and_clean(self, df):
-        """Validar y limpiar datos"""
-        with tracer.start_as_current_span("validate_and_clean"):
-            # Validar campos requeridos
-            required_fields = [
-                'sensor_id', 'sensor_type', 'latitude', 'longitude',
-                'timestamp', 'vehicle_count', 'average_speed'
-            ]
-            
-            for field in required_fields:
-                df = df.filter(col(field).isNotNull())
-            
-            # Limpiar strings
-            df = df.withColumn('sensor_id', trim(lower(col('sensor_id'))))
-            df = df.withColumn('sensor_type', trim(lower(col('sensor_type'))))
-            
-            # Validar rangos
-            df = df.filter(
-                (col('latitude') >= -90) & (col('latitude') <= 90) &
-                (col('longitude') >= -180) & (col('longitude') <= 180)
-            )
-            
-            df = df.filter(col('vehicle_count') >= 0)
-            df = df.filter((col('average_speed') >= 0) & (col('average_speed') <= 200))
-            df = df.filter((col('air_quality_index') >= 0) & (col('air_quality_index') <= 500))
-            
-            logger.info(f"After validation: {df.count()} records")
-            return df
-
-    def enrich_data(self, df):
-        """Enriquecer datos"""
-        with tracer.start_as_current_span("enrich_data"):
-            # Clasificar tráfico
-            df = df.withColumn(
-                'traffic_level',
-                when(col('traffic_density') < 25, 'low')
-                .when(col('traffic_density') < 60, 'medium')
-                .when(col('traffic_density') < 85, 'high')
-                .otherwise('critical')
-            )
-            
-            # Clasificar calidad del aire
-            df = df.withColumn(
-                'air_quality_level',
-                when(col('air_quality_index') < 50, 'good')
-                .when(col('air_quality_index') < 100, 'moderate')
-                .when(col('air_quality_index') < 150, 'unhealthy_for_groups')
-                .when(col('air_quality_index') < 200, 'unhealthy')
-                .otherwise('hazardous')
-            )
-            
-            # Extraer componentes de timestamp
-            df = df.withColumn('year', year(col('timestamp')))
-            df = df.withColumn('month', month(col('timestamp')))
-            df = df.withColumn('day', dayofmonth(col('timestamp')))
-            df = df.withColumn('hour', hour(col('timestamp')))
-            
-            # Redondear valores numéricos
-            df = df.withColumn('latitude', spark_round(col('latitude'), 4))
-            df = df.withColumn('longitude', spark_round(col('longitude'), 4))
-            df = df.withColumn('average_speed', spark_round(col('average_speed'), 2))
-            df = df.withColumn('traffic_density', spark_round(col('traffic_density'), 2))
-            
-            return df
-
-    def save_silver_data(self, df):
-        """Guardar datos en Silver"""
-        try:
-            with tracer.start_as_current_span("save_silver"):
-                self._ensure_bucket_exists(MINIO_BUCKET_SILVER)
-                
-                silver_path = f"s3a://{MINIO_BUCKET_SILVER}/processed/"
-                
-                df.write \
-                    .mode("append") \
-                    .partitionBy("year", "month", "day", "hour") \
-                    .parquet(silver_path)
-                
-                logger.info(f"Saved {df.count()} records to Silver")
-                statsd_client.increment('silver.records_saved', df.count())
-                
-        except Exception as e:
-            logger.error(f"Error saving to Silver: {str(e)}")
-
-    def run_etl(self):
-        """Ejecutar pipeline ETL completo"""
-        etl_runs.add(1)
-        start_time = time.time()
-        
-        try:
-            with tracer.start_as_current_span("etl_pipeline"):
-                logger.info("Starting ETL pipeline")
-                
-                # Cargar datos
-                df = self.load_bronze_data()
-                if df is None:
-                    logger.warning("No data to process")
-                    return
-                
-                # Validar y limpiar
-                df = self.validate_and_clean(df)
-                
-                # Enriquecer
-                df = self.enrich_data(df)
-                
-                # Guardar
-                self.save_silver_data(df)
-                
-                elapsed = time.time() - start_time
-                etl_duration.record(elapsed)
-                statsd_client.histogram('etl.duration_seconds', elapsed)
-                
-                logger.info(f"ETL completed in {elapsed:.2f} seconds")
-                
-        except Exception as e:
-            logger.error(f"Critical error in ETL: {str(e)}")
-
-# ============================================
-# SCHEDULER
-# ============================================
-
-def run_etl_scheduler():
-    """Ejecutar ETL cada 5 minutos"""
-    etl = SparkETL()
-    
-    while True:
-        try:
-            etl.run_etl()
-        except Exception as e:
-            logger.error(f"Error in ETL scheduler: {str(e)}")
-        
-        time.sleep(300)  # 5 minutos
-
-# ============================================
-# MAIN
-# ============================================
-
-if __name__ == "__main__":
-    run_etl_scheduler()
-</file>
-
-<file path="etl/gold_transformer.py">
-import json
-import logging
-import os
-import time
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Any
-from collections import defaultdict
-
-import boto3
-from opentelemetry import metrics, trace
-
-try:
-    from statsd import StatsClient as _StatsClient
-except Exception:
-    try:
-        from statsd.client import StatsClient as _StatsClient
-    except Exception:
-        _StatsClient = None
-
-import numpy as np
-
-from otel_setup import configure_observability
-
-
-class _NoOpStatsClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def increment(self, *args, **kwargs):
-        return None
-
-    def gauge(self, *args, **kwargs):
-        return None
-
-    def histogram(self, *args, **kwargs):
-        return None
-
-
-def _build_statsd_client(prefix: str):
-    if _StatsClient is None:
-        return _NoOpStatsClient()
-
-    try:
-        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
-    except Exception:
-        return _NoOpStatsClient()
-
-# ============================================
-# LOGGING
-# ============================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# ============================================
-# OBSERVABILIDAD
-# ============================================
-
-meter, tracer, _ = configure_observability("gold-transformer")
-
-statsd_client = _build_statsd_client('gold_transformer')
-
-# ============================================
-# MÉTRICAS
-# ============================================
-
-transformation_runs = meter.create_counter(
-    name="transformation_runs",
-    description="Total transformation runs",
-    unit="1"
-)
-
-documents_created = meter.create_counter(
-    name="documents_created",
-    description="Total documents created in gold",
-    unit="1"
-)
-
-transformation_duration = meter.create_histogram(
-    name="transformation_duration_seconds",
-    description="Transformation duration",
-    unit="s"
-)
-
-# ============================================
-# CONFIGURACIÓN
-# ============================================
-
-MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', 'minio:9000')
-MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
-MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
-MINIO_BUCKET_SILVER = os.getenv('MINIO_BUCKET_SILVER', 'silver')
-MINIO_BUCKET_GOLD = os.getenv('MINIO_BUCKET_GOLD', 'gold')
-
-# ============================================
-# CLIENTE S3 (MinIO)
-# ============================================
-
-class S3Client:
-    def __init__(self):
-        self.s3_client = boto3.client(
-            's3',
-            endpoint_url=f'http://{MINIO_ENDPOINT}',
-            aws_access_key_id=MINIO_ACCESS_KEY,
-            aws_secret_access_key=MINIO_SECRET_KEY,
-            region_name='us-east-1'
-        )
-        self._ensure_bucket_exists(MINIO_BUCKET_GOLD)
-
-    def _ensure_bucket_exists(self, bucket: str):
-        """Crear bucket si no existe"""
-        try:
-            self.s3_client.head_bucket(Bucket=bucket)
-        except Exception:
-            self.s3_client.create_bucket(Bucket=bucket)
-
-    def list_parquet_files(self, prefix: str = "processed/") -> List[str]:
-        """Listar archivos Parquet en Silver"""
-        try:
-            response = self.s3_client.list_objects_v2(
-                Bucket=MINIO_BUCKET_SILVER,
-                Prefix=prefix
-            )
-
-            if 'Contents' not in response:
-                return []
-
-            return [obj['Key'] for obj in response['Contents'] if obj['Key'].endswith('.parquet')]
-        except Exception as e:
-            logger.error(f"Error listing S3 objects: {str(e)}")
-            return []
-
-    def read_parquet_file(self, key: str) -> Optional[List[Dict]]:
-        """Leer archivo Parquet"""
-        try:
-            import pyarrow.parquet as pq
-
-            obj = self.s3_client.get_object(
-                Bucket=MINIO_BUCKET_SILVER,
-                Key=key
-            )
-
-            parquet_file = pq.read_table(obj['Body'])
-            return parquet_file.to_pandas().to_dict('records')
-        except Exception as e:
-            logger.error(f"Error reading parquet file: {str(e)}")
-            return None
-
-    def write_json(self, bucket: str, key: str, data: List[Dict]):
-        """Escribir datos JSON a MinIO"""
-        try:
-            self.s3_client.put_object(
-                Bucket=bucket,
-                Key=key,
-                Body=json.dumps(data, default=str),
-                ContentType='application/json'
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Error writing JSON to MinIO: {str(e)}")
-            return False
-
-    def read_json(self, bucket: str, prefix: str) -> List[Dict]:
-        """Leer datos JSON desde MinIO"""
-        try:
-            response = self.s3_client.list_objects_v2(
-                Bucket=bucket,
-                Prefix=prefix
-            )
-
-            if 'Contents' not in response:
-                return []
-
-            all_records = []
-            for obj in response['Contents']:
-                if not obj['Key'].endswith('.json'):
-                    continue
-                obj_response = self.s3_client.get_object(
-                    Bucket=bucket,
-                    Key=obj['Key']
-                )
-                content = json.loads(obj_response['Body'].read().decode('utf-8'))
-                if isinstance(content, list):
-                    all_records.extend(content)
-                else:
-                    all_records.append(content)
-
-            return all_records
-        except Exception as e:
-            logger.error(f"Error reading JSON from MinIO: {str(e)}")
-            return []
-
-# ============================================
-# GOLD TRANSFORMER
-# ============================================
-
-class GoldTransformer:
-    def __init__(self):
-        self.s3_client = S3Client()
-        self.last_processed_time = datetime.utcnow()
-
-    def generate_traffic_metrics(self, records: List[Dict]) -> Dict[str, Any]:
-        """Generar métricas de tráfico"""
-        if not records:
-            return {}
-
-        speeds = [r.get('average_speed', 0) for r in records if 'average_speed' in r]
-        densities = [r.get('traffic_density', 0) for r in records if 'traffic_density' in r]
-
-        return {
-            'avg_speed': float(np.mean(speeds)) if speeds else 0,
-            'max_speed': float(np.max(speeds)) if speeds else 0,
-            'min_speed': float(np.min(speeds)) if speeds else 0,
-            'avg_density': float(np.mean(densities)) if densities else 0,
-            'max_density': float(np.max(densities)) if densities else 0,
-            'records_count': len(records)
-        }
-
-    def generate_air_quality_metrics(self, records: List[Dict]) -> Dict[str, Any]:
-        """Generar métricas de calidad del aire"""
-        if not records:
-            return {}
-
-        aqi_values = [r.get('air_quality_index', 0) for r in records if 'air_quality_index' in r]
-        noise_levels = [r.get('noise_level', 0) for r in records if 'noise_level' in r]
-
-        return {
-            'avg_aqi': float(np.mean(aqi_values)) if aqi_values else 0,
-            'max_aqi': float(np.max(aqi_values)) if aqi_values else 0,
-            'min_aqi': float(np.min(aqi_values)) if aqi_values else 0,
-            'avg_noise': float(np.mean(noise_levels)) if noise_levels else 0,
-            'max_noise': float(np.max(noise_levels)) if noise_levels else 0,
-        }
-
-    def generate_hourly_aggregates(self, records: List[Dict]) -> List[Dict]:
-        """Generar agregados por hora"""
-        aggregates = defaultdict(list)
-
-        for record in records:
-            key = (
-                record.get('year'),
-                record.get('month'),
-                record.get('day'),
-                record.get('hour'),
-                record.get('sensor_type')
-            )
-            aggregates[key].append(record)
-
-        result = []
-        for (year, month, day, hour, sensor_type), group_records in aggregates.items():
-            if sensor_type == 'traffic':
-                metrics_data = self.generate_traffic_metrics(group_records)
-            elif sensor_type == 'air_quality':
-                metrics_data = self.generate_air_quality_metrics(group_records)
-            else:
-                metrics_data = {'records_count': len(group_records)}
-
-            result.append({
-                'timestamp': datetime(year, month, day, hour).isoformat(),
-                'year': year,
-                'month': month,
-                'day': day,
-                'hour': hour,
-                'sensor_type': sensor_type,
-                'metrics': metrics_data,
-                'record_count': len(group_records)
-            })
-
-        return result
-
-    def generate_incident_reports(self, records: List[Dict]) -> List[Dict]:
-        """Generar reportes de incidentes"""
-        incidents = [r for r in records if r.get('incident_detected', False)]
-
-        return [
-            {
-                'timestamp': r.get('timestamp').isoformat() if hasattr(r.get('timestamp'), 'isoformat') else r.get('timestamp'),
-                'sensor_id': r.get('sensor_id'),
-                'sensor_type': r.get('sensor_type'),
-                'incident_type': r.get('incident_type'),
-                'location': {
-                    'latitude': r.get('latitude'),
-                    'longitude': r.get('longitude')
-                },
-                'intersection': r.get('intersection')
-            }
-            for r in incidents
-        ]
-
-    def transform_and_load(self):
-        """Transformar datos de Silver a Gold y almacenar en MinIO"""
-        transformation_runs.add(1)
-        start_time = time.time()
-
-        try:
-            with tracer.start_as_current_span("transform_to_gold"):
-                logger.info("Starting Gold transformation")
-
-                sample_records = self._generate_sample_records()
-
-                if not sample_records:
-                    logger.warning("No records to transform")
-                    return
-
-                now = datetime.utcnow()
-                date_str = now.strftime("%Y-%m-%d")
-
-                # Generar agregados por hora
-                hourly_aggregates = self.generate_hourly_aggregates(sample_records)
-                if hourly_aggregates:
-                    key = f"hourly_metrics/date={date_str}/{int(time.time() * 1000)}.json"
-                    if self.s3_client.write_json(MINIO_BUCKET_GOLD, key, hourly_aggregates):
-                        documents_created.add(len(hourly_aggregates))
-                        logger.info(f"Wrote {len(hourly_aggregates)} hourly metrics to gold/{key}")
-                        statsd_client.increment('documents.inserted', len(hourly_aggregates))
-
-                # Generar reportes de incidentes
-                incident_reports = self.generate_incident_reports(sample_records)
-                if incident_reports:
-                    key = f"incident_reports/date={date_str}/{int(time.time() * 1000)}.json"
-                    if self.s3_client.write_json(MINIO_BUCKET_GOLD, key, incident_reports):
-                        documents_created.add(len(incident_reports))
-                        logger.info(f"Wrote {len(incident_reports)} incident reports to gold/{key}")
-                        statsd_client.increment('documents.inserted', len(incident_reports))
-
-                elapsed = time.time() - start_time
-                transformation_duration.record(elapsed)
-                statsd_client.histogram('transformation.duration_seconds', elapsed)
-
-                logger.info(f"Gold transformation completed in {elapsed:.2f} seconds")
-
-        except Exception as e:
-            logger.error(f"Critical error in transformation: {str(e)}")
-            statsd_client.increment('transformation.failed')
-
-    def _generate_sample_records(self) -> List[Dict]:
-        """Generar registros de ejemplo (simular lectura de Parquet)"""
-        import random
-        from datetime import datetime
-
-        now = datetime.utcnow()
-        records = []
-
-        for i in range(100):
-            records.append({
-                'sensor_id': f'SENSOR_{random.randint(1, 100):04d}',
-                'sensor_type': random.choice(['traffic', 'air_quality', 'noise']),
-                'year': now.year,
-                'month': now.month,
-                'day': now.day,
-                'hour': now.hour,
-                'latitude': -12.0462 + (random.random() - 0.5) * 0.1,
-                'longitude': -77.0371 + (random.random() - 0.5) * 0.1,
-                'average_speed': random.uniform(20, 80),
-                'traffic_density': random.uniform(0, 100),
-                'air_quality_index': random.uniform(0, 300),
-                'noise_level': random.uniform(40, 90),
-                'incident_detected': random.random() > 0.95,
-                'incident_type': random.choice(['accident', 'congestion', 'breakdown', 'none']),
-                'intersection': f'INT_{random.randint(1, 50):04d}',
-                'timestamp': datetime(now.year, now.month, now.day, now.hour)
-            })
-
-        return records
-
-    def run_scheduler(self):
-        """Ejecutar scheduler de transformación"""
-        while True:
-            try:
-                self.transform_and_load()
-            except Exception as e:
-                logger.error(f"Error in transformation scheduler: {str(e)}")
-
-            time.sleep(600)  # 10 minutos
-
-
-# ============================================
-# MAIN
-# ============================================
-
-if __name__ == "__main__":
-    transformer = GoldTransformer()
-    transformer.run_scheduler()
-</file>
-
-<file path="etl/requirements_gold.txt">
-boto3==1.28.0
-pyarrow==16.0.0
-numpy==2.1.3
-opentelemetry-api==1.31.0
-opentelemetry-sdk==1.31.0
-opentelemetry-exporter-otlp-proto-http==1.31.0
-opentelemetry-instrumentation==0.52b0
-python-statsd==2.1.0
-</file>
-
 <file path="etl/requirements.txt">
 pyspark==3.5.0
 boto3==1.28.0
@@ -3891,479 +1725,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 CMD ["python", "main.py"]
-</file>
-
-<file path="fastapi_service/main.py">
-import json
-import logging
-import os
-import time
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
-
-import boto3
-from fastapi import FastAPI, Query, HTTPException
-from pydantic import BaseModel
-from opentelemetry import metrics, trace
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.requests import RequestsInstrumentor
-
-try:
-    from statsd import StatsClient as _StatsClient
-except Exception:
-    try:
-        from statsd.client import StatsClient as _StatsClient
-    except Exception:
-        _StatsClient = None
-
-import uvicorn
-
-from otel_setup import configure_observability
-
-
-class _NoOpStatsClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def increment(self, *args, **kwargs):
-        return None
-
-    def gauge(self, *args, **kwargs):
-        return None
-
-    def histogram(self, *args, **kwargs):
-        return None
-
-
-def _build_statsd_client(prefix: str):
-    if _StatsClient is None:
-        return _NoOpStatsClient()
-
-    try:
-        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
-    except Exception:
-        return _NoOpStatsClient()
-
-# ============================================
-# LOGGING
-# ============================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# ============================================
-# OBSERVABILIDAD
-# ============================================
-
-meter, tracer, _ = configure_observability("fastapi")
-
-RequestsInstrumentor().instrument()
-
-statsd_client = _build_statsd_client('fastapi')
-
-# ============================================
-# MÉTRICAS
-# ============================================
-
-requests_total = meter.create_counter(
-    name="requests_total",
-    description="Total requests",
-    unit="1"
-)
-
-request_duration = meter.create_histogram(
-    name="request_duration_ms",
-    description="Request duration",
-    unit="ms"
-)
-
-# ============================================
-# CONFIGURACIÓN
-# ============================================
-
-MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', 'minio:9000')
-MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
-MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
-MINIO_BUCKET_GOLD = os.getenv('MINIO_BUCKET_GOLD', 'gold')
-
-# ============================================
-# MODELOS
-# ============================================
-
-class HealthResponse(BaseModel):
-    status: str
-    timestamp: str
-    service: str
-
-class MetricValue(BaseModel):
-    avg_speed: Optional[float] = None
-    max_speed: Optional[float] = None
-    min_speed: Optional[float] = None
-    avg_density: Optional[float] = None
-    max_density: Optional[float] = None
-    avg_aqi: Optional[float] = None
-    max_aqi: Optional[float] = None
-    records_count: Optional[int] = None
-
-class HourlyMetric(BaseModel):
-    timestamp: str
-    year: int
-    month: int
-    day: int
-    hour: int
-    sensor_type: str
-    metrics: MetricValue
-    record_count: int
-
-class Location(BaseModel):
-    latitude: float
-    longitude: float
-
-class IncidentReport(BaseModel):
-    timestamp: str
-    sensor_id: str
-    sensor_type: str
-    incident_type: str
-    location: Location
-    intersection: str
-
-# ============================================
-# CLIENTE MINIO (Gold Layer)
-# ============================================
-
-class MinIOClient:
-    def __init__(self):
-        self.s3_client = boto3.client(
-            's3',
-            endpoint_url=f'http://{MINIO_ENDPOINT}',
-            aws_access_key_id=MINIO_ACCESS_KEY,
-            aws_secret_access_key=MINIO_SECRET_KEY,
-            region_name='us-east-1'
-        )
-        self.bucket = MINIO_BUCKET_GOLD
-
-    def read_all_json(self, prefix: str) -> List[Dict]:
-        """Leer todos los archivos JSON de un prefijo en MinIO"""
-        try:
-            response = self.s3_client.list_objects_v2(
-                Bucket=self.bucket,
-                Prefix=prefix
-            )
-
-            if 'Contents' not in response:
-                return []
-
-            all_records = []
-            for obj in response['Contents']:
-                if not obj['Key'].endswith('.json'):
-                    continue
-                obj_response = self.s3_client.get_object(
-                    Bucket=self.bucket,
-                    Key=obj['Key']
-                )
-                content = json.loads(obj_response['Body'].read().decode('utf-8'))
-                if isinstance(content, list):
-                    all_records.extend(content)
-                elif isinstance(content, dict):
-                    all_records.append(content)
-
-            return all_records
-        except Exception as e:
-            logger.error(f"Error reading from MinIO: {str(e)}")
-            return []
-
-    def health_check(self) -> bool:
-        """Verificar conectividad con MinIO"""
-        try:
-            self.s3_client.head_bucket(Bucket=self.bucket)
-            return True
-        except Exception:
-            return False
-
-# ============================================
-# FASTAPI APP
-# ============================================
-
-app = FastAPI(
-    title="Data Platform API",
-    description="Gold Layer API - Read-only access to processed data from MinIO",
-    version="2.0.0"
-)
-
-# Variable global para el cliente MinIO
-minio_client: Optional[MinIOClient] = None
-
-FastAPIInstrumentor.instrument_app(app)
-
-@app.on_event("startup")
-async def startup_event():
-    """Inicializar conexión a MinIO"""
-    global minio_client
-    try:
-        minio_client = MinIOClient()
-        logger.info("API started successfully - connected to MinIO gold layer")
-    except Exception as e:
-        logger.error(f"Failed to initialize MinIO client: {str(e)}")
-        raise
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cerrar cliente (sin efecto real para S3, pero mantenemos la estructura)"""
-    global minio_client
-    logger.info("API shutdown successfully")
-
-# ============================================
-# HEALTH CHECK
-# ============================================
-
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    """Health check endpoint"""
-    start_time = time.time()
-
-    try:
-        with tracer.start_as_current_span("health_check"):
-            requests_total.add(1)
-
-            if not minio_client.health_check():
-                raise HTTPException(status_code=503, detail="MinIO not available")
-
-            elapsed = (time.time() - start_time) * 1000
-            request_duration.record(elapsed)
-
-            return {
-                "status": "healthy",
-                "timestamp": datetime.utcnow().isoformat(),
-                "service": "data-platform-api"
-            }
-    except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        raise HTTPException(status_code=503, detail="Service unavailable")
-
-@app.get("/readiness")
-async def readiness_check():
-    """Readiness check endpoint"""
-    try:
-        if minio_client.health_check():
-            return {"status": "ready"}
-        raise Exception("MinIO not ready")
-    except Exception:
-        raise HTTPException(status_code=503, detail="Not ready")
-
-# ============================================
-# ENDPOINTS - HOURLY METRICS
-# ============================================
-
-@app.get("/api/v1/metrics/hourly", response_model=List[HourlyMetric])
-async def get_hourly_metrics(
-    sensor_type: Optional[str] = Query(None),
-    hours: int = Query(24, ge=1, le=720),
-    limit: int = Query(1000, ge=1, le=10000)
-):
-    """Obtener métricas por hora desde MinIO Gold"""
-    start_time = time.time()
-
-    try:
-        with tracer.start_as_current_span("get_hourly_metrics"):
-            requests_total.add(1)
-
-            # Leer todos los datos de hourly_metrics desde MinIO
-            all_records = minio_client.read_all_json("hourly_metrics/")
-
-            # Filtrar por tipo de sensor
-            if sensor_type:
-                all_records = [r for r in all_records if r.get('sensor_type', '').lower() == sensor_type.lower()]
-
-            # Filtrar por las últimas N horas
-            since = datetime.utcnow() - timedelta(hours=hours)
-            filtered = []
-            for r in all_records:
-                try:
-                    ts = datetime.fromisoformat(r['timestamp'])
-                    if ts >= since:
-                        filtered.append(r)
-                except (KeyError, ValueError):
-                    continue
-
-            # Ordenar por timestamp descendente y limitar
-            filtered.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-            results = filtered[:limit]
-
-            elapsed = (time.time() - start_time) * 1000
-            request_duration.record(elapsed)
-            statsd_client.histogram('endpoint.hourly_metrics.duration_ms', elapsed)
-
-            return results
-    except Exception as e:
-        logger.error(f"Error fetching hourly metrics: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ============================================
-# ENDPOINTS - INCIDENT REPORTS
-# ============================================
-
-@app.get("/api/v1/incidents", response_model=List[IncidentReport])
-async def get_incidents(
-    incident_type: Optional[str] = Query(None),
-    hours: int = Query(24, ge=1, le=720),
-    limit: int = Query(1000, ge=1, le=10000)
-):
-    """Obtener reportes de incidentes desde MinIO Gold"""
-    start_time = time.time()
-
-    try:
-        with tracer.start_as_current_span("get_incidents"):
-            requests_total.add(1)
-
-            # Leer todos los datos de incident_reports desde MinIO
-            all_records = minio_client.read_all_json("incident_reports/")
-
-            # Filtrar por tipo de incidente
-            if incident_type:
-                all_records = [r for r in all_records if r.get('incident_type', '').lower() == incident_type.lower()]
-
-            # Filtrar por las últimas N horas
-            since = datetime.utcnow() - timedelta(hours=hours)
-            filtered = []
-            for r in all_records:
-                try:
-                    ts = datetime.fromisoformat(r['timestamp'])
-                    if ts >= since:
-                        filtered.append(r)
-                except (KeyError, ValueError):
-                    continue
-
-            # Ordenar por timestamp descendente y limitar
-            filtered.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-            results = filtered[:limit]
-
-            elapsed = (time.time() - start_time) * 1000
-            request_duration.record(elapsed)
-            statsd_client.histogram('endpoint.incidents.duration_ms', elapsed)
-
-            return results
-    except Exception as e:
-        logger.error(f"Error fetching incidents: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ============================================
-# ENDPOINTS - AGGREGATIONS
-# ============================================
-
-@app.get("/api/v1/aggregations/by-sensor-type")
-async def get_aggregations_by_sensor_type(hours: int = Query(24, ge=1, le=720)):
-    """Obtener agregaciones por tipo de sensor desde MinIO Gold"""
-    start_time = time.time()
-
-    try:
-        with tracer.start_as_current_span("get_aggregations"):
-            requests_total.add(1)
-
-            # Leer todos los datos de hourly_metrics
-            all_records = minio_client.read_all_json("hourly_metrics/")
-
-            # Filtrar por las últimas N horas
-            since = datetime.utcnow() - timedelta(hours=hours)
-            filtered = []
-            for r in all_records:
-                try:
-                    ts = datetime.fromisoformat(r['timestamp'])
-                    if ts >= since:
-                        filtered.append(r)
-                except (KeyError, ValueError):
-                    continue
-
-            # Agrupar por tipo de sensor
-            groups: Dict[str, List[Dict]] = {}
-            for r in filtered:
-                st = r.get('sensor_type', 'unknown')
-                if st not in groups:
-                    groups[st] = []
-                groups[st].append(r)
-
-            # Calcular agregaciones
-            aggregations = []
-            for sensor_type, records in groups.items():
-                total_records = sum(r.get('record_count', 0) for r in records)
-                avg_records = total_records / len(records) if records else 0
-
-                aggregations.append({
-                    'sensor_type': sensor_type,
-                    'avg_records': round(avg_records, 2),
-                    'total_records': total_records,
-                    'count': len(records)
-                })
-
-            # Ordenar por total_records descendente
-            aggregations.sort(key=lambda x: x['total_records'], reverse=True)
-
-            elapsed = (time.time() - start_time) * 1000
-            request_duration.record(elapsed)
-
-            return {'aggregations': aggregations}
-    except Exception as e:
-        logger.error(f"Error fetching aggregations: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ============================================
-# ENDPOINTS - STATS
-# ============================================
-
-@app.get("/api/v1/stats/database")
-async def get_database_stats():
-    """Obtener estadísticas de la base de datos (Gold layer en MinIO)"""
-    start_time = time.time()
-
-    try:
-        with tracer.start_as_current_span("get_db_stats"):
-            requests_total.add(1)
-
-            hourly_metrics = minio_client.read_all_json("hourly_metrics/")
-            incidents = minio_client.read_all_json("incident_reports/")
-
-            stats = {
-                'hourly_metrics_count': len(hourly_metrics),
-                'incidents_count': len(incidents),
-                'timestamp': datetime.utcnow().isoformat(),
-                'storage': 'minio_gold'
-            }
-
-            elapsed = (time.time() - start_time) * 1000
-            request_duration.record(elapsed)
-
-            return stats
-    except Exception as e:
-        logger.error(f"Error fetching database stats: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ============================================
-# MAIN
-# ============================================
-
-if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info"
-    )
-</file>
-
-<file path="fastapi_service/requirements.txt">
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-boto3==1.28.0
-pydantic==2.9.2
-opentelemetry-api==1.31.0
-opentelemetry-sdk==1.31.0
-opentelemetry-exporter-otlp-proto-http==1.31.0
-opentelemetry-instrumentation-fastapi==0.52b0
-opentelemetry-instrumentation-requests==0.52b0
-opentelemetry-instrumentation==0.52b0
-python-statsd==2.1.0
 </file>
 
 <file path="generator/Dockerfile">
@@ -4393,8 +1754,8 @@ from datetime import datetime, timedelta
 from typing import Dict, Any
 
 import numpy as np
-from faker import Faker
 from kafka import KafkaProducer
+from kafka.admin import KafkaAdminClient, NewTopic
 from opentelemetry import metrics, trace
 
 try:
@@ -4477,6 +1838,24 @@ production_latency = meter.create_histogram(
     unit="ms"
 )
 
+traffic_vehicle_volume = meter.create_counter(
+    name="movilidad.vehiculos_por_minuto",
+    description="Vehicles observed per minute",
+    unit="1"
+)
+
+traffic_vehicle_by_avenue = meter.create_counter(
+    name="movilidad.vehiculos_por_avenida",
+    description="Vehicles observed by avenue",
+    unit="1"
+)
+
+traffic_vehicle_by_district = meter.create_counter(
+    name="movilidad.vehiculos_por_comuna",
+    description="Vehicles observed by district",
+    unit="1"
+)
+
 # ============================================
 # CONFIGURACIÓN
 # ============================================
@@ -4487,15 +1866,31 @@ NUM_SENSORS = 100
 BATCH_SIZE = 50
 INTERVAL_SECONDS = 2
 
-# Coordenadas ficticias de la ciudad
-CITY_CENTER_LAT = -12.0462
-CITY_CENTER_LNG = -77.0371
-LAT_RANGE = 0.1
-LNG_RANGE = 0.1
-
 SENSOR_TYPES = ['traffic', 'air_quality', 'noise', 'weather', 'incident']
 LIGHT_STATUS = ['green', 'red', 'yellow']
 INCIDENT_TYPES = ['accident', 'congestion', 'breakdown', 'road_closure', 'none']
+LOCATIONS = [
+    {"intersection": "INT_001", "avenue": "Alameda", "district": "Santiago Centro", "latitude": -33.4378, "longitude": -70.6504},
+    {"intersection": "INT_002", "avenue": "Alameda", "district": "Estación Central", "latitude": -33.4517, "longitude": -70.6765},
+    {"intersection": "INT_003", "avenue": "Av. Providencia", "district": "Providencia", "latitude": -33.4372, "longitude": -70.6303},
+    {"intersection": "INT_004", "avenue": "Av. Apoquindo", "district": "Las Condes", "latitude": -33.4218, "longitude": -70.6067},
+    {"intersection": "INT_005", "avenue": "Av. Vitacura", "district": "Vitacura", "latitude": -33.3938, "longitude": -70.5885},
+    {"intersection": "INT_006", "avenue": "Av. 10 de Julio", "district": "Lo Prado", "latitude": -33.4399, "longitude": -70.7151},
+    {"intersection": "INT_007", "avenue": "Av. Recoleta", "district": "Recoleta", "latitude": -33.4210, "longitude": -70.6508},
+    {"intersection": "INT_008", "avenue": "Av. Matta", "district": "Estación Central", "latitude": -33.4479, "longitude": -70.6753},
+    {"intersection": "INT_009", "avenue": "Av. España", "district": "Santiago Centro", "latitude": -33.4410, "longitude": -70.6542},
+    {"intersection": "INT_010", "avenue": "Av. Libertador B. O'Higgins", "district": "Santiago Centro", "latitude": -33.4480, "longitude": -70.6634},
+    {"intersection": "INT_011", "avenue": "Av. Grecia", "district": "Ñuñoa", "latitude": -33.4591, "longitude": -70.6138},
+    {"intersection": "INT_012", "avenue": "Av. Irarrázaval", "district": "Ñuñoa", "latitude": -33.4557, "longitude": -70.6121},
+    {"intersection": "INT_013", "avenue": "Av. San Diego", "district": "Santiago Centro", "latitude": -33.4447, "longitude": -70.6510},
+    {"intersection": "INT_014", "avenue": "Av. Santa Rosa", "district": "Las Condes", "latitude": -33.4130, "longitude": -70.5780},
+    {"intersection": "INT_015", "avenue": "Av. Grecia", "district": "Providencia", "latitude": -33.4310, "longitude": -70.6205},
+    {"intersection": "INT_016", "avenue": "Av. Ejército", "district": "Santiago Centro", "latitude": -33.4302, "longitude": -70.6507},
+    {"intersection": "INT_017", "avenue": "Av. Pajaritos", "district": "Lo Espejo", "latitude": -33.5275, "longitude": -70.6965},
+    {"intersection": "INT_018", "avenue": "Av. Vicuña Mackenna", "district": "Macul", "latitude": -33.4920, "longitude": -70.6196},
+    {"intersection": "INT_019", "avenue": "Av. Principal", "district": "La Cisterna", "latitude": -33.5401, "longitude": -70.6649},
+    {"intersection": "INT_020", "avenue": "Av. Circunvalación", "district": "San Miguel", "latitude": -33.4932, "longitude": -70.6498},
+]
 
 # ============================================
 # GENERADOR DE EVENTOS
@@ -4503,12 +1898,22 @@ INCIDENT_TYPES = ['accident', 'congestion', 'breakdown', 'road_closure', 'none']
 
 class EventGenerator:
     def __init__(self):
-        self.fake = Faker()
         self.producer = None
         self.sensor_ids = [f"SENSOR_{i:04d}" for i in range(1, NUM_SENSORS + 1)]
-        self.intersections = [
-            f"INT_{i:04d}" for i in range(1, NUM_SENSORS // 2 + 1)
-        ]
+
+    def ensure_topic(self):
+        """Crear o recrear el topic de Kafka para evitar mensajes antiguos con codec incompatibles."""
+        try:
+            admin_client = KafkaAdminClient(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS], client_id='generator-admin')
+            topics = admin_client.list_topics()
+            if KAFKA_TOPIC in topics:
+                admin_client.delete_topics([KAFKA_TOPIC], timeout_ms=10000)
+                time.sleep(2)
+            admin_client.create_topics([NewTopic(name=KAFKA_TOPIC, num_partitions=1, replication_factor=1)], timeout_ms=10000)
+            admin_client.close()
+            logger.info(f"Ensured Kafka topic {KAFKA_TOPIC} exists")
+        except Exception as exc:
+            logger.warning(f"Topic bootstrap skipped: {exc}")
 
     def connect_kafka(self):
         """Conectar a Kafka"""
@@ -4517,11 +1922,11 @@ class EventGenerator:
             max_retries = 5
             while retry_count < max_retries:
                 try:
+                    self.ensure_topic()
                     self.producer = KafkaProducer(
                         bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
                         value_serializer=lambda v: json.dumps(v).encode('utf-8'),
                         acks='all',
-                        compression_type='snappy',
                         request_timeout_ms=30000,
                         retries=3
                     )
@@ -4537,19 +1942,45 @@ class EventGenerator:
                         logger.error(f"Failed to connect to Kafka after {max_retries} attempts")
                         return False
 
+    def _emit_traffic_metrics(self, event: Dict[str, Any]):
+        """Emitir métricas de movilidad a OTel y DogStatsD."""
+        vehicle_count = int(event.get('vehicle_count', 0) or 0)
+        avenue = event.get('avenue', 'unknown')
+        district = event.get('district', 'unknown')
+
+        traffic_vehicle_volume.add(vehicle_count)
+        traffic_vehicle_by_avenue.add(vehicle_count, attributes={'avenue': avenue})
+        traffic_vehicle_by_district.add(vehicle_count, attributes={'district': district})
+
+        try:
+            statsd_client.increment('movilidad.vehiculos_por_minuto', value=vehicle_count)
+            statsd_client.increment(
+                'movilidad.vehiculos_por_avenida',
+                value=vehicle_count,
+                tags=[f'avenue:{avenue}']
+            )
+            statsd_client.increment(
+                'movilidad.vehiculos_por_comuna',
+                value=vehicle_count,
+                tags=[f'district:{district}']
+            )
+        except TypeError:
+            statsd_client.increment('movilidad.vehiculos_por_avenida', value=vehicle_count)
+            statsd_client.increment('movilidad.vehiculos_por_comuna', value=vehicle_count)
+
     def generate_event(self, sensor_id: str) -> Dict[str, Any]:
-        """Generar un evento simulado de sensor"""
+        """Generar un evento simulado de sensor con ubicación realista."""
         sensor_type = random.choice(SENSOR_TYPES)
-        
-        base_lat = CITY_CENTER_LAT + (random.random() - 0.5) * LAT_RANGE
-        base_lng = CITY_CENTER_LNG + (random.random() - 0.5) * LNG_RANGE
-        
+        location = random.choice(LOCATIONS)
+
         event = {
             'sensor_id': sensor_id,
             'sensor_type': sensor_type,
-            'intersection': random.choice(self.intersections),
-            'latitude': round(base_lat, 6),
-            'longitude': round(base_lng, 6),
+            'intersection': location['intersection'],
+            'avenue': location['avenue'],
+            'district': location['district'],
+            'latitude': round(location['latitude'], 6),
+            'longitude': round(location['longitude'], 6),
             'vehicle_count': max(0, int(np.random.poisson(25))),
             'average_speed': round(np.random.normal(40, 15), 2),
             'traffic_density': round(random.uniform(0, 100), 2),
@@ -4560,9 +1991,9 @@ class EventGenerator:
             'incident_type': random.choice(INCIDENT_TYPES) if random.random() > 0.8 else 'none',
             'temperature': round(random.uniform(15, 35), 2),
             'humidity': round(random.uniform(30, 90), 2),
-            'timestamp': datetime.utcnow().isoformat() + 'Z'
+            'timestamp': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
         }
-        
+
         return event
 
     def produce_events(self):
@@ -4597,6 +2028,7 @@ class EventGenerator:
                                 
                                 events_produced.add(1)
                                 statsd_client.increment('events.produced')
+                                self._emit_traffic_metrics(event)
                                 
                         except Exception as e:
                             logger.error(f"Error sending event: {str(e)}")
@@ -4781,6 +2213,21 @@ dashboards:
       - title: "API Endpoints Performance"
         type: table
         query: "avg:fastapi.endpoint.*_duration_ms{} by {endpoint}"
+
+  - name: "Mobility Metrics"
+    description: "Urban mobility business metrics"
+    widgets:
+      - title: "Vehículos por minuto"
+        type: timeseries
+        query: "sum:movilidad.vehiculos_por_minuto{}.as_count()"
+
+      - title: "Vehículos por avenida"
+        type: toplist
+        query: "sum:movilidad.vehiculos_por_avenida{} by {avenue}"
+
+      - title: "Vehículos por comuna"
+        type: toplist
+        query: "sum:movilidad.vehiculos_por_comuna{} by {district}"
 
   - name: "System Metrics"
     description: "Docker and system resource metrics"
@@ -5524,207 +2971,6 @@ Ejecutar: `docker compose up -d`
 Acceder: http://localhost/docs
 </file>
 
-<file path="QUICKSTART.sh">
-#!/bin/bash
-
-# ============================================
-# QUICK START - Data Platform MVP
-# ============================================
-
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║   Data Platform MVP - Data Engineering Architecture       ║"
-echo "║   Medallion Architecture with Full Observability          ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-# Verificar Docker
-echo "📦 Verificando requisitos..."
-if ! command -v docker &> /dev/null; then
-    echo "❌ Docker no está instalado. Por favor instalar Docker Desktop."
-    exit 1
-fi
-
-if ! command -v docker compose &> /dev/null; then
-    echo "❌ Docker Compose no está instalado."
-    exit 1
-fi
-
-echo "✅ Docker instalado"
-echo ""
-
-# Mostrar servicios
-echo "🚀 Iniciando servicios..."
-echo ""
-echo "Servicios que se levantarán:"
-echo "  ✓ Zookeeper (2181)"
-echo "  ✓ Kafka (9092)"
-echo "  ✓ MinIO S3 (9000, 9001)"
-echo "  ✓ Datadog Agent (8126)"
-echo "  ✓ Data Generator"
-echo "  ✓ Streaming Worker (Bronze)"
-echo "  ✓ ETL Spark (Silver)"
-echo "  ✓ Gold Transformer (Gold)"
-echo "  ✓ FastAPI (8000)"
-echo "  ✓ Nginx Proxy (80, 443)"
-echo ""
-
-# Levantar servicios
-docker compose up -d
-
-echo "⏳ Esperando servicios para iniciar (30 segundos)..."
-sleep 30
-
-# Verificar salud
-echo ""
-echo "🏥 Verificando salud de servicios..."
-
-HEALTHY=0
-TOTAL=10
-
-# Verificar FastAPI
-if curl -s http://localhost/health > /dev/null 2>&1; then
-    echo "  ✅ FastAPI API"
-    HEALTHY=$((HEALTHY + 1))
-else
-    echo "  ⏳ FastAPI (iniciando...)"
-fi
-
-# Verificar Kafka
-if docker compose exec -T kafka kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1; then
-    echo "  ✅ Kafka"
-    HEALTHY=$((HEALTHY + 1))
-else
-    echo "  ⏳ Kafka (iniciando...)"
-fi
-
-# Verificar MinIO
-if curl -s http://localhost:9000/minio/health/live > /dev/null 2>&1; then
-    echo "  ✅ MinIO"
-    HEALTHY=$((HEALTHY + 1))
-else
-    echo "  ⏳ MinIO (iniciando...)"
-fi
-
-echo ""
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║              PLATAFORMA INICIADA EXITOSAMENTE             ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "📊 ACCESO A SERVICIOS:"
-echo ""
-echo "  🌐 API Docs (FastAPI):"
-echo "     http://localhost/docs"
-echo ""
-echo "  🪣 MinIO Console:"
-echo "     http://localhost:9001"
-echo "     Credenciales: minioadmin / minioadmin"
-echo ""
-echo "  Capas de datos (todo en MinIO):"
-echo "     - Bronze: datos crudos (JSON)"
-echo "     - Silver: datos limpios (Parquet)"
-echo "     - Gold: métricas e incidentes (JSON)"
-echo ""
-echo "  📈 Datadog (si está configurado):"
-echo "     https://app.datadoghq.com"
-echo ""
-
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║                    PRÓXIMOS PASOS                          ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "1️⃣  VER LOGS DE GENERADOR:"
-echo "    docker compose logs -f generator"
-echo ""
-
-echo "2️⃣  VERIFICAR ESTADO:"
-echo "    docker compose ps"
-echo ""
-
-echo "3️⃣  PROBAR API:"
-echo "    curl http://localhost/health"
-echo ""
-
-echo "4️⃣  VERIFICAR DATOS EN BRONZE:"
-echo "    docker compose exec minio mc ls local/bronze/raw"
-echo ""
-
-echo "5️⃣  CONSULTAR GOLD (MinIO):"
-echo "    docker compose exec minio mc ls local/gold/hourly_metrics/"
-echo ""
-
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║                    DOCUMENTACIÓN                           ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "📚 Documentación Disponible:"
-echo "   - README.md              : Guía general"
-echo "   - docs/Architecture.md   : Arquitectura detallada"
-echo "   - docs/Pipeline.md       : Flujo de datos"
-echo "   - docs/Medallion.md      : Patrón Medallion"
-echo "   - docs/Observability.md  : Monitoreo y métricas"
-echo "   - docs/Deployment.md     : Despliegue y escalado"
-echo "   - docs/ADR.md            : Decisiones arquitectónicas"
-echo "   - docs/Testing.md        : Guía de testing"
-echo ""
-
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║                   DATADOG (OPCIONAL)                       ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "Para habilitar Datadog:"
-echo ""
-echo "  export DD_API_KEY='tu_api_key_aqui'"
-echo "  docker compose restart datadog-agent"
-echo ""
-echo "  Luego acceder a: https://app.datadoghq.com"
-echo ""
-
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║                   PARAR LA PLATAFORMA                      ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "  docker compose down"
-echo ""
-
-echo "📝 Para limpiar datos:"
-echo "  bash scripts/clean.sh"
-echo ""
-
-echo "✅ ¡Plataforma lista para usar!"
-</file>
-
-<file path="scripts/clean.sh">
-#!/bin/bash
-
-# Script para limpiar la plataforma
-
-echo "¿Estás seguro de que deseas limpiar todos los datos? (s/n)"
-read -r response
-
-if [ "$response" != "s" ]; then
-    echo "Cancelado"
-    exit 0
-fi
-
-echo "Deteniendo servicios..."
-docker compose down
-
-echo "Eliminando volúmenes..."
-docker volume rm \
-    et-ingenier-a-de-datos_minio_data \
-    et-ingenier-a-de-datos_datadog_socket || true
-
-echo "Eliminando directorios de datos..."
-rm -rf data/{bronze,silver,gold}/*
-
-echo "✓ Limpieza completada"
-</file>
-
 <file path="scripts/health-check.sh">
 #!/bin/bash
 
@@ -5776,106 +3022,6 @@ else
 fi
 </file>
 
-<file path="scripts/init.sh">
-#!/bin/bash
-
-# Script de inicialización de la plataforma
-# Uso: bash init.sh
-
-set -e
-
-echo "================================"
-echo "Data Platform - Initialization"
-echo "================================"
-
-# Colores
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-# Verificar Docker
-echo -e "${YELLOW}[1/5] Verificando Docker...${NC}"
-if ! command -v docker &> /dev/null; then
-    echo -e "${RED}Error: Docker no está instalado${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Docker OK${NC}"
-
-# Verificar Docker Compose
-echo -e "${YELLOW}[2/5] Verificando Docker Compose...${NC}"
-if ! command -v docker compose &> /dev/null; then
-    echo -e "${RED}Error: Docker Compose no está instalado${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Docker Compose OK${NC}"
-
-# Crear directorios necesarios
-echo -e "${YELLOW}[3/5] Creando directorios...${NC}"
-mkdir -p data/{bronze,silver,gold,minio}
-echo -e "${GREEN}✓ Directorios creados${NC}"
-
-# Configurar variables de entorno
-echo -e "${YELLOW}[4/5] Configurando variables de entorno...${NC}"
-if [ ! -f .env ]; then
-    cat > .env << EOF
-# Datadog
-DD_API_KEY=test_key_local_only
-
-# Kafka
-KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-KAFKA_TOPIC=raw_events
-
-# MinIO
-MINIO_ENDPOINT=minio:9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin
-
-# Gold (MinIO buckets)
-MINIO_BUCKET_BRONZE=bronze
-MINIO_BUCKET_SILVER=silver
-MINIO_BUCKET_GOLD=gold
-EOF
-    echo -e "${GREEN}✓ Archivo .env creado${NC}"
-else
-    echo -e "${GREEN}✓ Archivo .env ya existe${NC}"
-fi
-
-# Levantar servicios
-echo -e "${YELLOW}[5/5] Levantando servicios Docker...${NC}"
-docker compose up -d
-
-echo ""
-echo -e "${GREEN}================================${NC}"
-echo -e "${GREEN}Inicialización completada!${NC}"
-echo -e "${GREEN}================================${NC}"
-echo ""
-echo "Servicios en ejecución:"
-echo "  - Zookeeper: localhost:2181"
-echo "  - Kafka: localhost:9092"
-echo "  - MinIO: http://localhost:9000"
-echo "  - MinIO Console: http://localhost:9001"
-echo "  - FastAPI Docs: http://localhost/docs"
-echo "  - Datadog Agent: localhost:8126"
-echo ""
-echo "Capas de datos (todo en MinIO):"
-echo "  - Bronze: eventos crudos desde Kafka"
-echo "  - Silver: datos limpios y enriquecidos (Parquet)"
-echo "  - Gold: métricas agregadas e incidentes (JSON)"
-echo ""
-echo "Credenciales MinIO: minioadmin / minioadmin"
-echo ""
-echo "Próximos pasos:"
-echo "  1. Verificar servicios: docker compose ps"
-echo "  2. Ver logs: docker compose logs -f"
-echo "  3. Consultar API: curl http://localhost/health"
-echo ""
-echo "Para usar Datadog:"
-echo "  export DD_API_KEY='your_real_api_key'"
-echo "  docker compose restart datadog-agent"
-echo ""
-</file>
-
 <file path="scripts/logs.sh">
 #!/bin/bash
 
@@ -5919,60 +3065,6 @@ else
     
     docker compose logs -f "$CONTAINER"
 fi
-</file>
-
-<file path="scripts/test.sh">
-#!/bin/bash
-
-# Script para ejecutar pruebas en la plataforma
-
-echo "================================"
-echo "Testing Data Platform"
-echo "================================"
-echo ""
-
-# Test 1: Health Check
-echo "[Test 1] Health Check..."
-curl -s http://localhost/health | jq .
-echo ""
-
-# Test 2: Generate test event
-echo "[Test 2] Verificar generador de eventos..."
-docker compose logs generator | grep "Batch produced" | tail -1
-echo ""
-
-# Test 3: Check Kafka topic
-echo "[Test 3] Verificar Kafka..."
-docker compose exec kafka kafka-consumer-groups.sh \
-    --bootstrap-server localhost:9092 \
-    --group bronze_workers \
-    --describe 2>/dev/null || echo "No consumer group info available"
-echo ""
-
-# Test 4: Check MinIO buckets
-echo "[Test 4] Verificar MinIO buckets..."
-docker compose exec minio mc ls local/bronze 2>/dev/null || echo "No bronze data yet"
-echo ""
-
-# Test 5: Check MinIO Gold layer (replaces MongoDB)
-echo "[Test 5] Verificar MinIO (Gold/processed data)..."
-docker compose exec minio mc ls local/gold 2>/dev/null || echo "No gold data yet"
-echo ""
-
-# Test 6: API endpoints
-echo "[Test 6] Probar API endpoints..."
-echo "GET /api/v1/stats/database"
-curl -s http://localhost/api/v1/stats/database | jq .
-echo ""
-
-# Test 7: Request a metrics
-echo "[Test 7] Probar GET /api/v1/metrics/hourly..."
-curl -s "http://localhost/api/v1/metrics/hourly?limit=1" | jq . | head -20
-echo ""
-
-echo "================================"
-echo "Testing completado!"
-echo "================================"
 </file>
 
 <file path="START_HERE.md">
@@ -6359,6 +3451,7 @@ CMD ["python", "worker.py"]
 <file path="streaming_worker/requirements.txt">
 kafka-python==2.0.2
 boto3==1.28.0
+python-snappy==0.7.3
 opentelemetry-api==1.31.0
 opentelemetry-sdk==1.31.0
 opentelemetry-exporter-otlp-proto-http==1.31.0
@@ -6376,6 +3469,7 @@ from typing import Optional
 
 import boto3
 from kafka import KafkaConsumer
+from kafka.admin import KafkaAdminClient, NewTopic
 from opentelemetry import metrics, trace
 
 try:
@@ -6507,7 +3601,7 @@ class MinIOClient:
                 self.s3_client.put_object(
                     Bucket=self.bucket,
                     Key=key,
-                    Body=json.dumps(event),
+                    Body=json.dumps(event, default=str).encode('utf-8'),
                     ContentType='application/json'
                 )
                 
@@ -6528,6 +3622,20 @@ class StreamingWorker:
         self.consumer: Optional[KafkaConsumer] = None
         self.minio_client = MinIOClient()
 
+    def ensure_topic(self):
+        """Asegurar que el topic exista y esté limpio para la ingesta de Bronze."""
+        try:
+            admin_client = KafkaAdminClient(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS], client_id='worker-admin')
+            topics = admin_client.list_topics()
+            if KAFKA_TOPIC in topics:
+                admin_client.delete_topics([KAFKA_TOPIC], timeout_ms=10000)
+                time.sleep(2)
+            admin_client.create_topics([NewTopic(name=KAFKA_TOPIC, num_partitions=1, replication_factor=1)], timeout_ms=10000)
+            admin_client.close()
+            logger.info(f"Ensured Kafka topic {KAFKA_TOPIC} exists")
+        except Exception as exc:
+            logger.warning(f"Topic bootstrap skipped: {exc}")
+
     def connect_kafka(self):
         """Conectar a Kafka"""
         retry_count = 0
@@ -6535,6 +3643,7 @@ class StreamingWorker:
         
         while retry_count < max_retries:
             try:
+                self.ensure_topic()
                 self.consumer = KafkaConsumer(
                     KAFKA_TOPIC,
                     bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
@@ -7070,6 +4179,2322 @@ temp/
 node_modules
 </file>
 
+<file path="docker-compose.yml">
+services:
+  # ============================================
+  # INFRAESTRUCTURA
+  # ============================================
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_INIT_LIMIT: 5
+      ZK_CLIENT_PORT: 2181
+      KAFKA_BROKER_ID: 1
+    ports:
+      - "2181:2181"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_COMPRESSION_TYPE: snappy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # DATADOG AGENT
+  # ============================================
+
+  datadog-agent:
+    image: datadog/agent:latest
+    container_name: datadog-agent
+    environment:
+      DD_API_KEY: ${DD_API_KEY:-test_key_local_only}
+      DD_SITE: ${DD_SITE:-datadoghq.com}
+      DD_LOGS_ENABLED: "true"
+      DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL: "true"
+      DD_CONTAINER_EXCLUDE_LOGS: "image:datadog/agent"
+      DD_APM_ENABLED: "true"
+      DD_TRACE_SAMPLE_RATE: 1
+      DD_METRICS_LIMIT: 2000
+      DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"
+      DD_DOGSTATSD_SOCKET: /var/run/datadog/dsd.sock
+    ports:
+      - "8126:8126"
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./monitoring/datadog-agent.yaml:/etc/datadog-agent/datadog.yaml:ro
+      - datadog_socket:/var/run/datadog
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "agent", "status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # COMPONENTES DE DATOS
+  # ============================================
+
+  generator:
+    build:
+      context: ./generator
+      dockerfile: Dockerfile
+    container_name: data-generator
+    depends_on:
+      kafka:
+        condition: service_healthy
+      datadog-agent:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: raw_events
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: 8126
+      DD_DOGSTATSD_HOST: datadog-agent
+      DD_DOGSTATSD_PORT: 8125
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
+      OTEL_ENVIRONMENT: local
+      PYTHONUNBUFFERED: 1
+    networks:
+      - data-platform
+    volumes:
+      - datadog_socket:/var/run/datadog
+    restart: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  streaming-worker:
+    build:
+      context: ./streaming_worker
+      dockerfile: Dockerfile
+    container_name: streaming-worker
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      datadog-agent:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: raw_events
+      KAFKA_GROUP_ID: bronze_workers
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: bronze
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: 8126
+      DD_DOGSTATSD_HOST: datadog-agent
+      DD_DOGSTATSD_PORT: 8125
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
+      OTEL_ENVIRONMENT: local
+      PYTHONUNBUFFERED: 1
+    networks:
+      - data-platform
+    volumes:
+      - datadog_socket:/var/run/datadog
+    restart: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  etl-spark:
+    build:
+      context: ./etl
+      dockerfile: Dockerfile
+    container_name: etl-spark
+    depends_on:
+      minio:
+        condition: service_healthy
+      datadog-agent:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET_BRONZE: bronze
+      MINIO_BUCKET_SILVER: silver
+      SPARK_LOCAL_IP: etl-spark
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: 8126
+      DD_DOGSTATSD_HOST: datadog-agent
+      DD_DOGSTATSD_PORT: 8125
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
+      OTEL_ENVIRONMENT: local
+      PYTHONUNBUFFERED: 1
+    networks:
+      - data-platform
+    volumes:
+      - datadog_socket:/var/run/datadog
+    restart: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  gold-transformer:
+    build:
+      context: ./etl
+      dockerfile: Dockerfile.gold
+    container_name: gold-transformer
+    depends_on:
+      minio:
+        condition: service_healthy
+      datadog-agent:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET_SILVER: silver
+      MINIO_BUCKET_GOLD: gold
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: 8126
+      DD_DOGSTATSD_HOST: datadog-agent
+      DD_DOGSTATSD_PORT: 8125
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
+      OTEL_ENVIRONMENT: local
+      PYTHONUNBUFFERED: 1
+    networks:
+      - data-platform
+    volumes:
+      - datadog_socket:/var/run/datadog
+    restart: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # API Y APLICACIONES
+  # ============================================
+
+  fastapi:
+    build:
+      context: ./fastapi_service
+      dockerfile: Dockerfile
+    container_name: fastapi-server
+    depends_on:
+      minio:
+        condition: service_healthy
+      datadog-agent:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET_GOLD: gold
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: 8126
+      DD_DOGSTATSD_HOST: datadog-agent
+      DD_DOGSTATSD_PORT: 8125
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://datadog-agent:4318
+      OTEL_ENVIRONMENT: local
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "8000:8000"
+    networks:
+      - data-platform
+    volumes:
+      - datadog_socket:/var/run/datadog
+    restart: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================
+  # MONITOREO Y LOGGING
+  # ============================================
+
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./monitoring/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - fastapi
+      - minio
+    networks:
+      - data-platform
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  data-platform:
+    driver: bridge
+
+volumes:
+  minio_data:
+  datadog_socket:
+</file>
+
+<file path="docs/ARCHITECTURE.md">
+# Arquitectura del Data Platform
+
+## Visión General
+
+La plataforma sigue la arquitectura **Medallion** (también conocida como Lakehouse Architecture), que divide el procesamiento de datos en tres capas lógicas:
+
+## 1. Bronze Layer (Raw Data)
+
+### Propósito
+Almacenar datos crudos tal como llegan del sistema fuente.
+
+### Características
+- **Ingesta**: Kafka Streaming
+- **Almacenamiento**: MinIO (S3-compatible)
+- **Formato**: JSON
+- **Particionamiento**: Por fecha y hora
+- **Retención**: 24 horas (configurable)
+
+### Estructura
+```
+s3://bronze/
+└── raw/
+    └── date=2024-01-15/
+        └── hour=10/
+            └── 1705330245000.json
+            └── 1705330245001.json
+            ...
+```
+
+### Flujo
+```
+Generador de Datos
+    ↓ (Kafka)
+Kafka Topic "raw_events"
+    ↓ (Consumer Group: bronze_workers)
+Streaming Worker
+    ↓ (Batch)
+MinIO S3 (bronze)
+```
+
+## 2. Silver Layer (Cleansed & Enriched)
+
+### Propósito
+Datos limpios, validados, normalizados y enriquecidos.
+
+### Características
+- **Procesamiento**: Apache Spark
+- **Almacenamiento**: MinIO (S3-compatible)
+- **Formato**: Parquet (columnar)
+- **Particionamiento**: year/month/day/hour
+- **Intervalo de actualización**: 5 minutos
+- **Retención**: 30 días
+
+### Transformaciones
+
+#### Validación
+- Campos requeridos no nulos
+- Rangos válidos:
+  - Latitude: [-90, 90]
+  - Longitude: [-180, 180]
+  - Vehicle count: >= 0
+  - Speed: [0, 200]
+  - Air Quality: [0, 500]
+
+#### Limpieza
+- Trimming de strings
+- Lowercase de IDs
+- Eliminación de duplicados
+
+#### Enriquecimiento
+```python
+# Clasificación de tráfico
+traffic_level = case(
+    when(traffic_density < 25, "low"),
+    when(traffic_density < 60, "medium"),
+    when(traffic_density < 85, "high"),
+    else="critical"
+)
+
+# Clasificación de calidad del aire
+air_quality_level = case(
+    when(aqi < 50, "good"),
+    when(aqi < 100, "moderate"),
+    when(aqi < 150, "unhealthy_for_groups"),
+    when(aqi < 200, "unhealthy"),
+    else="hazardous"
+)
+
+# Extracción de componentes de timestamp
+year, month, day, hour = extract_date_components(timestamp)
+```
+
+### Estructura
+```
+s3://silver/
+└── processed/
+    └── year=2024/
+        └── month=01/
+            └── day=15/
+                └── hour=10/
+                    └── part-00000.parquet
+                    └── part-00001.parquet
+```
+
+### Esquema
+
+```python
+StructType([
+    StructField("sensor_id", StringType()),
+    StructField("sensor_type", StringType()),
+    StructField("latitude", DoubleType()),
+    StructField("longitude", DoubleType()),
+    StructField("timestamp", TimestampType()),
+    StructField("vehicle_count", IntegerType()),
+    StructField("average_speed", DoubleType()),
+    StructField("traffic_density", DoubleType()),
+    StructField("air_quality_index", DoubleType()),
+    StructField("traffic_level", StringType()),  # Enriquecido
+    StructField("air_quality_level", StringType()),  # Enriquecido
+    StructField("year", IntegerType()),  # Particionado
+    StructField("month", IntegerType()),  # Particionado
+    StructField("day", IntegerType()),  # Particionado
+    StructField("hour", IntegerType()),  # Particionado
+])
+```
+
+## 3. Gold Layer (Business Ready)
+
+### Propósito
+Datos ya procesados, listos para consultas y análisis.
+
+### Características
+- **Procesamiento**: Agregaciones y transformaciones (Gold Transformer)
+- **Almacenamiento**: MinIO (S3-compatible)
+- **Formato**: JSON
+- **Intervalo de actualización**: 10 minutos
+- **Acceso**: REST API con FastAPI
+
+### Estructura en MinIO
+```
+s3://gold/
+├── hourly_metrics/
+│   └── date=2024-01-15/
+│       └── 1705330245000.json
+└── incident_reports/
+    └── date=2024-01-15/
+        └── 1705330245001.json
+```
+
+### Entidades
+
+#### Hourly Metrics
+Agregados por hora de cada tipo de sensor.
+
+```json
+{
+  "timestamp": "2024-01-15T10:00:00",
+  "year": 2024,
+  "month": 1,
+  "day": 15,
+  "hour": 10,
+  "sensor_type": "traffic",
+  "metrics": {
+    "avg_speed": 42.5,
+    "max_speed": 85.3,
+    "min_speed": 15.2,
+    "avg_density": 58.3,
+    "max_density": 95.0,
+    "records_count": 150
+  },
+  "record_count": 150
+}
+```
+
+#### Incident Reports
+Reportes de incidentes detectados.
+
+```json
+{
+  "timestamp": "2024-01-15T10:15:30",
+  "sensor_id": "SENSOR_0042",
+  "sensor_type": "traffic",
+  "incident_type": "accident",
+  "location": {
+    "latitude": -12.0456,
+    "longitude": -77.0365
+  },
+  "intersection": "INT_0042"
+}
+```
+
+## Componentes de Sistema
+
+### 1. Data Generator
+
+**Responsabilidad**: Simular sensores IoT
+
+**Especificaciones**:
+- 100 sensores simultáneos
+- Eventos cada 2 segundos (batch de 50)
+- Variación realista de datos
+- Geolocalización simulada en Lima
+
+**Producción de Eventos**:
+- Rate: ~25 eventos/segundo
+- Formato: JSON
+- Canal: Kafka
+
+### 2. Kafka
+
+**Cluster**:
+- Brokers: 1
+- Topics: 1 (raw_events)
+- Particiones: 1
+- Replication Factor: 1
+
+**Configuración**:
+- Retention: 24 horas
+- Compression: snappy
+- Serialization: JSON
+
+### 3. Streaming Worker
+
+**Responsabilidad**: Consumir de Kafka y escribir en Bronze
+
+**Características**:
+- Consumer Group: bronze_workers
+- Poll Size: 100 mensajes
+- Commit: Auto
+- Particionamiento: Por fecha/hora
+
+**Performance**:
+- Latencia esperada: < 100ms
+
+### 4. Spark ETL
+
+**Configuración**:
+- Master: local[*]
+- Memory: 2GB (configurable)
+- Shuffle Partitions: 4 (configurable)
+- Execution Mode: local
+
+**Procesamiento**:
+- Input: MinIO Bronze (JSON)
+- Output: MinIO Silver (Parquet)
+- Intervalo: 5 minutos
+
+**Optimizaciones**:
+- Predicate pushdown
+- Column pruning
+- Broadcast joins
+
+### 5. Gold Transformer
+
+**Responsabilidad**: Transformar Silver a Gold
+
+**Agregaciones**:
+- Hourly metrics por sensor_type
+- Detección de incidentes
+- Estadísticas de locación
+
+**Almacenamiento**: MinIO Gold (JSON)
+**Formato**: JSON particionado por fecha
+**Intervalo**: 10 minutos
+
+### 6. FastAPI
+
+**Endpoints**:
+- GET /health - Health check
+- GET /readiness - Readiness check
+- GET /api/v1/metrics/hourly - Métricas por hora
+- GET /api/v1/incidents - Reportes de incidentes
+- GET /api/v1/aggregations/by-sensor-type - Agregaciones
+- GET /api/v1/stats/database - Estadísticas
+
+**Almacenamiento**: Lee desde MinIO Gold layer (S3 API)
+
+**Rate Limiting**: No implementado (MVP)
+
+**Authentication**: No implementada (MVP)
+
+## Flujos de Datos
+
+### Ingesta
+
+```
+Generador
+  ↓
+Kafka (raw_events)
+  ↓ Streaming Worker
+MinIO Bronze
+  ↓ ~100-200 eventos/segundo
+~8.6M eventos/día
+```
+
+### Procesamiento ETL
+
+```
+MinIO Bronze (cada 5 min)
+  ↓
+Spark Local
+  - Validación
+  - Limpieza
+  - Enriquecimiento
+  - Particionamiento
+  ↓
+MinIO Silver (Parquet)
+```
+
+### Agregación (Gold)
+
+```
+MinIO Silver (cada 10 min)
+  ↓
+Gold Transformer
+  - Agregación por hora
+  - Detección de incidentes
+  ↓
+MinIO Gold (JSON)
+  - hourly_metrics/
+  - incident_reports/
+```
+
+### Exposición
+
+```
+MinIO Gold (S3 API)
+  ↓
+FastAPI (boto3 S3 client)
+  ↓ JSON REST API
+Nginx Proxy
+  ↓
+Consumidores (Datadog, Dashboards, etc)
+```
+
+## Observabilidad
+
+### Puntos de Instrumentación
+
+1. **Generator**
+   - Events produced
+   - Production latency
+   - Kafka connection status
+
+2. **Streaming Worker**
+   - Messages consumed
+   - Messages stored
+   - Consumer lag
+   - Processing latency
+
+3. **ETL**
+   - Pipeline duration
+   - Records processed
+   - Invalid records
+   - S3 I/O metrics
+
+4. **Gold Transformer**
+   - Transformation runs
+   - Documents created
+   - MinIO I/O metrics
+
+5. **FastAPI**
+   - Requests total
+   - Request duration
+   - Endpoint-specific metrics
+
+### Métricas del Sistema
+
+- CPU usage por container
+- Memory usage por container
+- Disk usage
+- Network I/O
+- Container restart count
+
+## Decisiones Arquitectónicas
+
+1. **Medallion Architecture**: Separación clara de capas
+2. **Local Deployment**: Facilita desarrollo y testing
+3. **Parquet en Silver**: Compresión y velocidad
+4. **MinIO para todas las capas (Bronze, Silver, Gold)**: Simplifica la infraestructura, eliminando MongoDB
+5. **JSON en Gold**: Formato portable y legible para la API
+6. **OpenTelemetry + DogStatsD**: Estándar abierto + Datadog
+7. **Spark Local**: Suficiente para MVP, scalable a cluster
+
+## Consideraciones de Escala
+
+### Bottlenecks Identificados
+
+1. **Kafka Single Broker**: Limita throughput
+2. **Spark Local**: Limita procesamiento
+3. **MinIO Single Node**: Sin replicación
+
+### Mejoras Futuras
+
+1. Kafka Multi-broker cluster
+2. Spark Cluster mode (YARN/K8s)
+3. MinIO Distributed mode
+4. Caching layer (Redis)
+5. Data Lake indexing optimization
+
+## Seguridad
+
+### MVP (Minimal)
+
+- Credenciales en variables de entorno
+- No hay encriptación en tránsito (local)
+- No hay autenticación en APIs
+
+### Consideraciones Futuras
+
+- API keys y JWT
+- Encriptación TLS
+- Network segmentation
+- Audit logging
+- Bucket policies en MinIO
+</file>
+
+<file path="docs/Medallion.md">
+# Arquitectura Medallion
+
+## ¿Qué es Medallion?
+
+La arquitectura Medallion (también llamada "Lakehouse Architecture" o "Delta Lake Architecture") es un patrón de arquitectura de datos que organiza datos en capas de creciente calidad y complejidad.
+
+## Niveles
+
+### 1. Bronze Level (Raw)
+
+La capa bruta contiene datos tal como se reciben de los sistemas fuente.
+
+**Características**:
+- Sin transformaciones
+- Sin validaciones
+- Sin enriquecimiento
+- Datos históricos sin cambios
+
+**Ventajas**:
+- Fácil ingesta
+- Recuperación de datos originales
+- Auditabilidad completa
+- Sin pérdida de información
+
+**Nuestro Caso**:
+```
+Formato: JSON
+Fuente: Kafka
+Almacenamiento: MinIO S3
+Particionamiento: date/hour
+Tamaño: ~750 MB/día
+Retención: 24 horas
+```
+
+### 2. Silver Level (Cleansed)
+
+La capa procesada contiene datos limpios y validados.
+
+**Transformaciones**:
+- Validación de esquema
+- Limpieza de datos
+- Normalización
+- Eliminación de duplicados
+- Enriquecimiento
+
+**Ventajas**:
+- Datos listos para análisis
+- Mejor performance (Parquet)
+- Consistencia garantizada
+- Auditoría de calidad
+
+**Nuestro Caso**:
+```
+Formato: Parquet
+Procesador: Apache Spark
+Almacenamiento: MinIO S3
+Particionamiento: year/month/day/hour
+Tamaño: ~375 MB/día (50% reducción)
+Retención: 30 días
+```
+
+### 3. Gold Level (Curated)
+
+La capa curada contiene datos específicos del negocio, listos para consumo.
+
+**Características**:
+- Agregaciones
+- Métricas de negocio
+- KPIs
+- Dimensiones normalizadas
+
+**Ventajas**:
+- Rendimiento óptimo
+- Sem ántica de negocio clara
+- Acceso simplificado
+- Independencia de fuente
+
+**Nuestro Caso**:
+```
+Formato: JSON
+Procesador: Gold Transformer (Python)
+Almacenamiento: MinIO (gold bucket)
+Particionamiento: date=YYYY-MM-DD
+Tipos de Datos:
+  - hourly_metrics/
+  - incident_reports/
+Retención: Indefinida
+```
+
+## Flujo de Datos
+
+### Timeline Ejemplo
+
+```
+T+0:     Evento generado
+T+50ms:  Evento en Kafka
+T+100ms: Evento en Bronze (JSON)
+T+5min:  Lote en Bronze listo para procesar
+T+7min:  Datos en Silver (Parquet)
+T+10min: Agregaciones calculadas
+T+12min: Datos en Gold (MinIO JSON)
+T+13min: Disponible en API
+```
+
+### Volúmenes
+
+```
+Entrada (Bronze):        2.16M eventos/día
+Después Validación:      2.05M eventos/día (95% válidos)
+Silver (Parquet):        2.05M registros
+Gold (Hourly Metrics):   120 documentos/día
+Gold (Incidents):        21.6K documentos/día
+```
+
+## Ventajas de Medallion
+
+### 1. Escalabilidad
+- Datos crudos en Bronze facilitan la ingesta
+- Capa Silver permite procesamiento eficiente
+- Gold proporciona acceso rápido
+
+### 2. Flexibilidad
+- Agregar nuevas fuentes en Bronze
+- Nuevas transformaciones en Silver
+- Nuevos casos de uso en Gold
+
+### 3. Calidad de Datos
+- Cada capa valida y mejora
+- Trazabilidad completa
+- Recuperación de errores posible
+
+### 4. Seguridad
+- Control de acceso por capa
+- Auditoría de cambios
+- Preservación de datos originales
+
+### 5. Costo
+- Compresión en Silver/Gold
+- Retención flexible
+- Almacenamiento eficiente
+
+## Versioning y Time Travel
+
+Una ventaja adicional del Parquet + particionamiento:
+
+### Silver
+
+```
+s3://silver/processed/year=2024/month=01/day=15/hour=10/
+s3://silver/processed/year=2024/month=01/day=15/hour=11/
+s3://silver/processed/year=2024/month=01/day=16/hour=10/
+```
+
+Cualquier análisis puede referenciar datos de momentos específicos.
+
+### Gold
+
+Con particionamiento por fecha en MinIO, el versionamiento es implícito:
+
+```
+s3://gold/hourly_metrics/date=2024-01-15/
+s3://gold/hourly_metrics/date=2024-01-16/
+```
+
+Cada ejecución del Gold Transformer produce archivos nuevos que pueden ser consumidos por la API.
+
+## Casos de Uso
+
+### 1. Debugging
+```
+¿Datos incorrectos en API?
+1. Ver documento en Gold
+2. Buscar en Silver (Parquet)
+3. Validar en Bronze (JSON original)
+```
+
+### 2. Auditoría
+```
+¿Quién accedió qué dato?
+1. Logs en Bronze
+2. Transformaciones en Silver
+3. Acceso en Gold
+```
+
+### 3. Machine Learning
+```
+1. Bronze: Raw features
+2. Silver: Engineered features
+3. Gold: ML-ready datasets
+```
+
+### 4. Business Intelligence
+```
+1. Bronze: Event logs
+2. Silver: Normalized facts
+3. Gold: Dimensions + Measures
+```
+
+## Antipatrones a Evitar
+
+### 1. Saltarse Bronze
+❌ Enviar datos directamente a Silver
+✓ Siempre preservar originales en Bronze
+
+### 2. Bronze como Data Warehouse
+❌ Intentar consultar Bronze directamente
+✓ Usar Gold para consultas
+
+### 3. Sin Validación en Silver
+❌ Copiar datos sin validar
+✓ Aplicar reglas de calidad
+
+### 4. Gold sin Particionamiento
+❌ Datos Gold sin particionar
+✓ Particionar por fecha para consultas eficientes
+
+## Monitoreo de Medallion
+
+### Métricas Importantes
+
+| Métrica | Ideal | Alerta |
+|---------|-------|--------|
+| Bronze → Silver Lag | <5 min | >15 min |
+| Silver → Gold Lag | <10 min | >20 min |
+| Silver Válidos | >95% | <90% |
+| Gold Queries P95 | <200ms | >1000ms |
+
+### Queries de Monitoreo
+
+```python
+# Tamaño por capa
+SELECT 
+  'bronze' as layer,
+  COUNT(*) as records,
+  SUM(file_size) as total_size
+FROM bronze_events
+
+# Calidad
+SELECT
+  COUNT(CASE WHEN is_valid THEN 1 END) as valid,
+  COUNT(*) as total,
+  ROUND(100.0 * COUNT(CASE WHEN is_valid THEN 1 END) / COUNT(*), 2) as pct_valid
+FROM silver_events
+
+# Performance
+SELECT
+  'hourly_metrics' as collection,
+  COUNT(*) as documents,
+  ROUND(AVG(query_time_ms), 2) as avg_query_ms
+FROM gold_queries
+```
+
+## Evolución Futura
+
+### Fase 1 (Actual)
+- Bronze: JSON en MinIO
+- Silver: Parquet en MinIO
+- Gold: JSON en MinIO
+- API: FastAPI leyendo desde MinIO Gold (sin MongoDB)
+
+### Fase 2 (Próxima)
+- Agregar Delta Lake
+- Versioning automático
+- ACID guarantees
+- Time travel
+
+### Fase 3
+- Multicloud (Bronze in AWS S3, Silver in Azure, Gold in GCP)
+- Real-time Bronze (Kafka → Bronze sin batching)
+- ML Feature Store
+
+## Referencias
+
+- [Databricks Lakehouse](https://databricks.com/blog/2021/08/30/frequently-asked-questions-about-the-databricks-lakehouse.html)
+- [Gartner Modern Data Architecture](https://www.gartner.com/en/documents/3981889)
+- [Delta Lake](https://delta.io/)
+</file>
+
+<file path="docs/Pipeline.md">
+# Pipeline de Datos Detallado
+
+## Visión General
+
+Este documento describe el flujo detallado de datos desde su generación hasta su exposición.
+
+## 1. Generación de Datos (Generator)
+
+### Ciclo de Generación
+
+```python
+while True:
+    for i in range(BATCH_SIZE):
+        # Seleccionar sensor aleatorio
+        sensor_id = random.choice(sensor_ids)
+        
+        # Generar evento
+        event = {
+            'sensor_id': sensor_id,
+            'sensor_type': random.choice(SENSOR_TYPES),
+            'latitude': base_lat + variation,
+            'longitude': base_lng + variation,
+            'vehicle_count': random.poisson(25),
+            'average_speed': random.normal(40, 15),
+            'traffic_density': uniform(0, 100),
+            'air_quality_index': uniform(0, 500),
+            'incident_detected': random.choice([True, False]),
+            'timestamp': datetime.utcnow().isoformat()
+        }
+        
+        # Enviar a Kafka
+        producer.send('raw_events', value=event)
+    
+    time.sleep(INTERVAL_SECONDS)
+```
+
+### Parametros
+
+- **NUM_SENSORS**: 100 sensores simultáneos
+- **BATCH_SIZE**: 50 eventos por batch
+- **INTERVAL_SECONDS**: 2 segundos entre batches
+- **Throughput**: ~25 eventos/segundo = ~2.16M eventos/día
+
+### Simulación de Datos
+
+```
+Lima: -12.0462, -77.0371
+
+Variación de coordenadas:
+  lat ±0.05 (aprox 5.5 km)
+  lng ±0.05 (aprox 5.5 km)
+
+Valores simulados:
+  vehicle_count: Poisson(λ=25)
+  average_speed: Normal(μ=40, σ=15)
+  traffic_density: Uniform(0, 100)
+  air_quality_index: Uniform(0, 500)
+  incident_detected: Bernoulli(p=0.05)
+```
+
+## 2. Kafka Topic
+
+### Configuración
+
+```yaml
+topic: raw_events
+partitions: 1
+replication_factor: 1
+retention_ms: 86400000  # 24 horas
+compression: snappy
+```
+
+### Estructura del Mensaje
+
+```json
+{
+  "key": null,
+  "value": {
+    "sensor_id": "SENSOR_0042",
+    "sensor_type": "traffic",
+    "intersection": "INT_0023",
+    "latitude": -12.0456,
+    "longitude": -77.0365,
+    "vehicle_count": 28,
+    "average_speed": 42.5,
+    "traffic_density": 65.3,
+    "traffic_light_status": "green",
+    "air_quality_index": 125,
+    "noise_level": 72.5,
+    "incident_detected": false,
+    "incident_type": "none",
+    "temperature": 24.5,
+    "humidity": 68.0,
+    "timestamp": "2024-01-15T10:30:45Z"
+  },
+  "timestamp": 1705330245000,
+  "offset": 12345,
+  "partition": 0
+}
+```
+
+### Consumo
+
+```yaml
+group_id: bronze_workers
+auto_offset_reset: earliest
+enable_auto_commit: true
+max_poll_records: 100
+session_timeout_ms: 30000
+```
+
+## 3. Bronze Layer - Streaming
+
+### Flujo de Escritura
+
+```
+Kafka Consumer
+    ↓ (Batch de 100 registros)
+JSON Serialization
+    ↓
+Partitioned Path Generation
+    date=2024-01-15/hour=10/
+    ↓
+MinIO Put Object
+    s3://bronze/raw/date=2024-01-15/hour=10/1705330245000.json
+```
+
+### Estructura de Almacenamiento
+
+```
+s3://bronze/
+└── raw/
+    └── date=2024-01-15/
+        └── hour=00/
+            ├── 1705283904000.json
+            ├── 1705283905000.json
+            └── ...
+        └── hour=01/
+            └── ...
+        └── ...
+        └── hour=23/
+            └── ...
+```
+
+### Tamaño de Datos
+
+```
+Eventos/día: 2.16M
+Tamaño por evento: ~350 bytes
+Total/día: 756 MB
+
+Retención 24h: 756 MB
+```
+
+### Latencia
+
+- Generación → Kafka: ~5ms
+- Kafka → Consumer: ~10ms
+- Batch → MinIO: ~50ms
+- **Total: ~65ms (P95)**
+
+## 4. ETL - Silver Layer
+
+### Scheduling
+
+```
+Cada 5 minutos:
+1. Leer Bronze (últimos 5 min)
+2. Validar
+3. Enriquecer
+4. Escribir Silver
+```
+
+### Procesamiento Detallado
+
+#### Validación
+
+```python
+# 1. Campos requeridos no nulos
+df = df.filter(
+    col('sensor_id').isNotNull() &
+    col('latitude').isNotNull() &
+    ...
+)
+
+# 2. Rangos válidos
+df = df.filter(
+    (col('latitude') >= -90) & (col('latitude') <= 90) &
+    (col('longitude') >= -180) & (col('longitude') <= 180) &
+    (col('vehicle_count') >= 0) &
+    ...
+)
+```
+
+#### Enriquecimiento
+
+```python
+# Clasificar tráfico
+df = df.withColumn(
+    'traffic_level',
+    when(col('traffic_density') < 25, 'low')
+    .when(col('traffic_density') < 60, 'medium')
+    .when(col('traffic_density') < 85, 'high')
+    .otherwise('critical')
+)
+
+# Extraer componentes de fecha
+df = df.withColumn('year', year(col('timestamp')))
+df = df.withColumn('month', month(col('timestamp')))
+df = df.withColumn('day', dayofmonth(col('timestamp')))
+df = df.withColumn('hour', hour(col('timestamp')))
+```
+
+#### Escritura
+
+```python
+df.write \
+    .mode("append") \
+    .partitionBy("year", "month", "day", "hour") \
+    .parquet(f"s3a://{bucket}/processed/")
+```
+
+### Estructura de Salida
+
+```
+s3://silver/
+└── processed/
+    └── year=2024/
+        └── month=01/
+            └── day=15/
+                └── hour=10/
+                    ├── part-00000.parquet
+                    ├── part-00001.parquet
+                    └── _SUCCESS
+```
+
+### Estadísticas
+
+```
+Entrada: 50,000 eventos (5 min)
+Validación: 95% válidos (47,500)
+Enriquecimiento: +8 columnas
+Salida: 47,500 registros
+Formato: Parquet (snappy compression)
+Tamaño: ~35 MB (50% reducción vs JSON)
+Duración: ~2 minutos
+Latencia: 5 min desde generación
+```
+
+## 5. Gold Layer - Transformación
+
+### Scheduling
+
+```
+Cada 10 minutos:
+1. Leer Silver (últimos 10 min)
+2. Agregaciones por hora
+3. Detección de incidentes
+4. Escribir en MinIO Gold (JSON)
+```
+
+### Agregaciones
+
+#### Hourly Metrics
+
+```python
+# Agrupar por hora y sensor_type
+aggregates = df.groupBy(
+    'year', 'month', 'day', 'hour', 'sensor_type'
+).agg(
+    avg('average_speed').alias('avg_speed'),
+    max('average_speed').alias('max_speed'),
+    avg('traffic_density').alias('avg_density'),
+    count('*').alias('record_count')
+)
+```
+
+#### Incident Reports
+
+```python
+# Filtrar incidentes
+incidents = df.filter(col('incident_detected') == True).select(
+    'timestamp',
+    'sensor_id',
+    'sensor_type',
+    'incident_type',
+    'latitude',
+    'longitude',
+    'intersection'
+)
+```
+
+### Resultados
+
+```
+Hourly Metrics (MinIO gold/hourly_metrics/):
+  100-200 métricas por 10 minutos
+
+Incident Reports (MinIO gold/incident_reports/):
+  5-10 reportes por 10 minutos
+  (1% de eventos son incidentes)
+```
+
+## 6. Gold Layer - Exposición
+
+### Endpoints FastAPI
+
+#### GET /api/v1/metrics/hourly
+
+```bash
+curl "http://localhost/api/v1/metrics/hourly?sensor_type=traffic&hours=24&limit=1000"
+
+Response:
+[
+  {
+    "timestamp": "2024-01-15T10:00:00",
+    "sensor_type": "traffic",
+    "metrics": {
+      "avg_speed": 42.5,
+      "max_speed": 85.3,
+      "avg_density": 58.3
+    },
+    "record_count": 150
+  },
+  ...
+]
+```
+
+#### GET /api/v1/incidents
+
+```bash
+curl "http://localhost/api/v1/incidents?incident_type=accident&hours=24"
+
+Response:
+[
+  {
+    "timestamp": "2024-01-15T10:15:30Z",
+    "sensor_id": "SENSOR_0042",
+    "incident_type": "accident",
+    "location": {
+      "latitude": -12.0456,
+      "longitude": -77.0365
+    }
+  },
+  ...
+]
+```
+
+### Latencia
+
+- API Request: ~50ms
+- MinIO Gold Read: ~30ms
+- Serialización JSON: ~10ms
+- Nginx Proxy: ~5ms
+- **Total: ~95ms (P95)**
+
+## 7. Flujo Completo End-to-End
+
+### Timeline Ejemplo
+
+```
+T+0s:    Generador crea 50 eventos
+T+5ms:   Eventos en Kafka
+T+50ms:  Eventos en Bronze MinIO
+T+5min:  ETL procesa batch
+T+7min:  Datos en Silver MinIO
+T+10min: Gold Transformer agrega
+T+12min: Datos en Gold MinIO
+T+12.5min: API expone datos
+T+13min: Consulta desde cliente
+
+Latencia Total: 13 minutos
+```
+
+### Volumen Acumulativo
+
+```
+Hora 0-1:   216,000 eventos → 204,000 en Silver (94% valid)
+Hora 1-2:   216,000 eventos → 204,000 en Silver
+...
+Día 1:      5,184,000 eventos → 4,900,000 en Silver
+
+Agregados Gold:
+  Hourly Metrics: 24 * 5 tipos sensores = 120 documentos
+  Incident Reports: 5,184,000 * 0.01 = 51,840 reportes
+```
+
+## 8. Optimizaciones del Pipeline
+
+### Caching
+
+```python
+# Cache Silver datos en memoria (próxima versión)
+df.cache()
+
+# Cache MongoDB queries
+db.hourly_metrics.createIndex(
+    { "timestamp": -1, "sensor_type": 1 }
+)
+```
+
+### Particionamiento
+
+```
+Bronze:  date/hour (24 particiones/día)
+Silver:  year/month/day/hour (8760 particiones/año)
+Gold:    Por tipo de agregación
+```
+
+### Compresión
+
+```
+JSON → Snappy: 350 bytes → 180 bytes (49%)
+Parquet + Snappy: 180 bytes → 90 bytes (49%)
+```
+
+## 9. Backpressure y Resiliencia
+
+### Generator → Kafka
+
+```python
+future = producer.send(event)
+future.get(timeout=5)  # Bloqueante hasta confirmación
+```
+
+### Kafka → Bronze
+
+```python
+# Auto-commit cada 100 mensajes
+# Si falla, se reintenta desde último offset
+enable_auto_commit=True
+```
+
+### Silver → Gold
+
+```python
+# Si transformación falla, se registra
+# Próximo job lo reintenta
+```
+
+## 10. Monitoreo del Pipeline
+
+### Métricas Clave
+
+| Métrica | Objetivo | Alerta |
+|---------|----------|--------|
+| Generator Rate | >25 e/s | <20 e/s |
+| Consumer Lag | <1000 | >5000 |
+| ETL Duration | <3min | >5min |
+| Silver Records | >45k/5min | <40k/5min |
+| Gold Latency | <10min | >15min |
+| API P95 | <200ms | >500ms |
+
+### Logs Importantes
+
+```
+[Generator] Batch produced: 50 events in 25ms
+[Worker] Batch produced: stored 50 events in 45ms
+[ETL] ETL completed in 120 seconds
+[Gold] Inserted 250 hourly metrics
+[API] GET /metrics/hourly - 200 OK - 85ms
+```
+</file>
+
+<file path="etl/etl_spark.py">
+import json
+import logging
+import os
+import time
+from datetime import datetime, timedelta
+from typing import Optional
+
+import boto3
+from pyspark.sql import SparkSession, Window
+from pyspark.sql.functions import (
+    col, when, round as spark_round, lower, trim, coalesce,
+    year, month, dayofmonth, hour, avg, max as spark_max, min as spark_min,
+    row_number, first, last, count, sum as spark_sum, to_timestamp
+)
+from opentelemetry import metrics, trace
+
+try:
+    from statsd import StatsClient as _StatsClient
+except Exception:
+    try:
+        from statsd.client import StatsClient as _StatsClient
+    except Exception:
+        _StatsClient = None
+
+from otel_setup import configure_observability
+
+
+class _NoOpStatsClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def increment(self, *args, **kwargs):
+        return None
+
+    def gauge(self, *args, **kwargs):
+        return None
+
+    def histogram(self, *args, **kwargs):
+        return None
+
+
+def _build_statsd_client(prefix: str):
+    if _StatsClient is None:
+        return _NoOpStatsClient()
+
+    try:
+        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
+    except Exception:
+        return _NoOpStatsClient()
+
+# ============================================
+# LOGGING
+# ============================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# OBSERVABILIDAD
+# ============================================
+
+meter, tracer, _ = configure_observability("etl-spark")
+
+statsd_client = _build_statsd_client('etl_spark')
+
+# ============================================
+# MÉTRICAS
+# ============================================
+
+etl_runs = meter.create_counter(
+    name="etl_runs",
+    description="Total ETL runs",
+    unit="1"
+)
+
+records_processed = meter.create_counter(
+    name="records_processed",
+    description="Total records processed",
+    unit="1"
+)
+
+records_invalid = meter.create_counter(
+    name="records_invalid",
+    description="Total invalid records",
+    unit="1"
+)
+
+etl_duration = meter.create_histogram(
+    name="etl_duration_seconds",
+    description="ETL execution duration",
+    unit="s"
+)
+
+# ============================================
+# CONFIGURACIÓN
+# ============================================
+
+MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', 'minio:9000')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+MINIO_BUCKET_BRONZE = os.getenv('MINIO_BUCKET_BRONZE', 'bronze')
+MINIO_BUCKET_SILVER = os.getenv('MINIO_BUCKET_SILVER', 'silver')
+
+# ============================================
+# SPARK SESSION
+# ============================================
+
+class SparkETL:
+    def __init__(self):
+        self.spark = self._create_spark_session()
+        self.s3_client = self._create_s3_client()
+        self._ensure_bucket_exists(MINIO_BUCKET_BRONZE)
+        self._ensure_bucket_exists(MINIO_BUCKET_SILVER)
+    def _create_spark_session(self) -> SparkSession:
+        """Crear Spark session"""
+        return SparkSession.builder \
+            .appName("DataPlatformETL") \
+            .master("local[*]") \
+            .config("spark.hadoop.fs.s3a.endpoint", f"http://{MINIO_ENDPOINT}") \
+            .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY) \
+            .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY) \
+            .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+            .config("spark.jars.packages", 
+                   "org.apache.hadoop:hadoop-aws:3.3.4,"
+                   "com.amazonaws:aws-java-sdk-bundle:1.12.261") \
+            .getOrCreate()
+
+    def _create_s3_client(self):
+        """Crear cliente S3 para MinIO"""
+        return boto3.client(
+            's3',
+            endpoint_url=f'http://{MINIO_ENDPOINT}',
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            region_name='us-east-1'
+        )
+
+    def _ensure_bucket_exists(self, bucket: str):
+        """Crear bucket si no existe"""
+        try:
+            self.s3_client.head_bucket(Bucket=bucket)
+        except Exception:
+            self.s3_client.create_bucket(Bucket=bucket)
+
+    def load_bronze_data(self) -> Optional[object]:
+        """Cargar datos de Bronze"""
+        try:
+            with tracer.start_as_current_span("load_bronze"):
+                # 1. Verificar primero con boto3 si hay archivos JSON en bronze/raw/
+                response = self.s3_client.list_objects_v2(
+                    Bucket=MINIO_BUCKET_BRONZE,
+                    Prefix="raw/"
+                )
+                if 'Contents' not in response or not any(obj['Key'].endswith('.json') for obj in response['Contents']):
+                    logger.warning("Aún no hay archivos JSON en la capa Bronze.")
+                    return None
+
+                # 2. Leer con Spark solo cuando confirmamos que existen datos
+                bronze_path = f"s3a://{MINIO_BUCKET_BRONZE}/raw/"
+                df = self.spark.read.json(bronze_path)
+                
+                if df.count() == 0:
+                    logger.warning("No data found in Bronze layer")
+                    return None
+                
+                logger.info(f"Loaded {df.count()} records from Bronze")
+                records_processed.add(df.count())
+                return df
+        except Exception as e:
+            logger.error(f"Error loading Bronze data: {str(e)}")
+            return None
+        
+    def validate_and_clean(self, df):
+        """Validar y limpiar datos"""
+        with tracer.start_as_current_span("validate_and_clean"):
+            # Validar campos requeridos
+            required_fields = [
+                'sensor_id', 'sensor_type', 'latitude', 'longitude',
+                'timestamp', 'vehicle_count', 'average_speed', 'avenue', 'district'
+            ]
+            
+            for field in required_fields:
+                df = df.filter(col(field).isNotNull())
+            
+            # Limpiar strings
+            df = df.withColumn('sensor_id', trim(lower(col('sensor_id'))))
+            df = df.withColumn('sensor_type', trim(lower(col('sensor_type'))))
+            df = df.withColumn('avenue', trim(col('avenue')))
+            df = df.withColumn('district', trim(col('district')))
+
+            df = df.withColumn('vehicle_count', col('vehicle_count').cast('int'))
+            df = df.withColumn('average_speed', col('average_speed').cast('double'))
+            df = df.withColumn('traffic_density', col('traffic_density').cast('double'))
+            df = df.withColumn('air_quality_index', col('air_quality_index').cast('double'))
+            df = df.withColumn('latitude', col('latitude').cast('double'))
+            df = df.withColumn('longitude', col('longitude').cast('double'))
+            df = df.withColumn('timestamp_parsed', to_timestamp(col('timestamp')))
+            df = df.filter(col('timestamp_parsed').isNotNull())
+            
+            # Validar rangos
+            df = df.filter(
+                (col('latitude') >= -90) & (col('latitude') <= 90) &
+                (col('longitude') >= -180) & (col('longitude') <= 180)
+            )
+            
+            df = df.filter(col('vehicle_count') >= 0)
+            df = df.filter((col('average_speed') >= 0) & (col('average_speed') <= 200))
+            df = df.filter((col('air_quality_index') >= 0) & (col('air_quality_index') <= 500))
+            
+            logger.info(f"After validation: {df.count()} records")
+            return df
+
+    def enrich_data(self, df):
+        """Enriquecer datos"""
+        with tracer.start_as_current_span("enrich_data"):
+            # Clasificar tráfico
+            df = df.withColumn(
+                'traffic_level',
+                when(col('traffic_density') < 25, 'low')
+                .when(col('traffic_density') < 60, 'medium')
+                .when(col('traffic_density') < 85, 'high')
+                .otherwise('critical')
+            )
+            
+            # Clasificar calidad del aire
+            df = df.withColumn(
+                'air_quality_level',
+                when(col('air_quality_index') < 50, 'good')
+                .when(col('air_quality_index') < 100, 'moderate')
+                .when(col('air_quality_index') < 150, 'unhealthy_for_groups')
+                .when(col('air_quality_index') < 200, 'unhealthy')
+                .otherwise('hazardous')
+            )
+            
+            # Extraer componentes de timestamp
+            df = df.withColumn('year', year(col('timestamp_parsed')))
+            df = df.withColumn('month', month(col('timestamp_parsed')))
+            df = df.withColumn('day', dayofmonth(col('timestamp_parsed')))
+            df = df.withColumn('hour', hour(col('timestamp_parsed')))
+            
+            # Redondear valores numéricos
+            df = df.withColumn('latitude', spark_round(col('latitude'), 4))
+            df = df.withColumn('longitude', spark_round(col('longitude'), 4))
+            df = df.withColumn('average_speed', spark_round(col('average_speed'), 2))
+            df = df.withColumn('traffic_density', spark_round(col('traffic_density'), 2))
+            
+            return df
+
+    def save_silver_data(self, df):
+        """Guardar datos en Silver"""
+        try:
+            with tracer.start_as_current_span("save_silver"):
+                self._ensure_bucket_exists(MINIO_BUCKET_SILVER)
+                
+                silver_path = f"s3a://{MINIO_BUCKET_SILVER}/processed/"
+                
+                df.write \
+                    .mode("append") \
+                    .partitionBy("year", "month", "day", "hour") \
+                    .parquet(silver_path)
+                
+                logger.info(f"Saved {df.count()} records to Silver")
+                statsd_client.increment('silver.records_saved', df.count())
+                
+        except Exception as e:
+            logger.error(f"Error saving to Silver: {str(e)}")
+
+    def run_etl(self):
+        """Ejecutar pipeline ETL completo"""
+        etl_runs.add(1)
+        start_time = time.time()
+        
+        try:
+            with tracer.start_as_current_span("etl_pipeline"):
+                logger.info("Starting ETL pipeline")
+                
+                # Cargar datos
+                df = self.load_bronze_data()
+                if df is None:
+                    logger.warning("No data to process")
+                    return
+                
+                # Validar y limpiar
+                df = self.validate_and_clean(df)
+                
+                # Enriquecer
+                df = self.enrich_data(df)
+                
+                # Guardar
+                self.save_silver_data(df)
+                
+                elapsed = time.time() - start_time
+                etl_duration.record(elapsed)
+                statsd_client.histogram('etl.duration_seconds', elapsed)
+                
+                logger.info(f"ETL completed in {elapsed:.2f} seconds")
+                
+        except Exception as e:
+            logger.error(f"Critical error in ETL: {str(e)}")
+
+# ============================================
+# SCHEDULER
+# ============================================
+
+def run_etl_scheduler():
+    """Ejecutar ETL cada 60 segundos para pruebas locales (en prod: 300)"""
+    etl = SparkETL()
+    
+    while True:
+        try:
+            etl.run_etl()
+        except Exception as e:
+            logger.error(f"Error in ETL scheduler: {str(e)}")
+        
+        time.sleep(60)  # <- Cambiar de 300 a 60 segundos
+
+# ============================================
+# MAIN
+# ============================================
+
+if __name__ == "__main__":
+    run_etl_scheduler()
+</file>
+
+<file path="etl/gold_transformer.py">
+import json
+import logging
+import os
+import io
+import time
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Any
+from collections import defaultdict
+
+import boto3
+from opentelemetry import metrics, trace
+
+try:
+    from statsd import StatsClient as _StatsClient
+except Exception:
+    try:
+        from statsd.client import StatsClient as _StatsClient
+    except Exception:
+        _StatsClient = None
+
+import numpy as np
+
+from otel_setup import configure_observability
+
+
+class _NoOpStatsClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def increment(self, *args, **kwargs):
+        return None
+
+    def gauge(self, *args, **kwargs):
+        return None
+
+    def histogram(self, *args, **kwargs):
+        return None
+
+
+def _build_statsd_client(prefix: str):
+    if _StatsClient is None:
+        return _NoOpStatsClient()
+
+    try:
+        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
+    except Exception:
+        return _NoOpStatsClient()
+
+# ============================================
+# LOGGING
+# ============================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# OBSERVABILIDAD
+# ============================================
+
+meter, tracer, _ = configure_observability("gold-transformer")
+
+statsd_client = _build_statsd_client('gold_transformer')
+
+# ============================================
+# MÉTRICAS
+# ============================================
+
+transformation_runs = meter.create_counter(
+    name="transformation_runs",
+    description="Total transformation runs",
+    unit="1"
+)
+
+documents_created = meter.create_counter(
+    name="documents_created",
+    description="Total documents created in gold",
+    unit="1"
+)
+
+transformation_duration = meter.create_histogram(
+    name="transformation_duration_seconds",
+    description="Transformation duration",
+    unit="s"
+)
+
+# ============================================
+# CONFIGURACIÓN
+# ============================================
+
+MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', 'minio:9000')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+MINIO_BUCKET_SILVER = os.getenv('MINIO_BUCKET_SILVER', 'silver')
+MINIO_BUCKET_GOLD = os.getenv('MINIO_BUCKET_GOLD', 'gold')
+
+# ============================================
+# CLIENTE S3 (MinIO)
+# ============================================
+
+class S3Client:
+    def __init__(self):
+        self.s3_client = boto3.client(
+            's3',
+            endpoint_url=f'http://{MINIO_ENDPOINT}',
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            region_name='us-east-1'
+        )
+        self._ensure_bucket_exists(MINIO_BUCKET_GOLD)
+
+    def _ensure_bucket_exists(self, bucket: str):
+        """Crear bucket si no existe"""
+        try:
+            self.s3_client.head_bucket(Bucket=bucket)
+        except Exception:
+            self.s3_client.create_bucket(Bucket=bucket)
+
+    def list_parquet_files(self, prefix: str = "processed/") -> List[str]:
+        """Listar archivos Parquet en Silver"""
+        try:
+            response = self.s3_client.list_objects_v2(
+                Bucket=MINIO_BUCKET_SILVER,
+                Prefix=prefix
+            )
+
+            if 'Contents' not in response:
+                return []
+
+            return [obj['Key'] for obj in response['Contents'] if obj['Key'].endswith('.parquet')]
+        except Exception as e:
+            logger.error(f"Error listing S3 objects: {str(e)}")
+            return []
+
+    def read_parquet_file(self, key: str) -> Optional[List[Dict]]:
+        """Leer archivo Parquet desde MinIO"""
+        try:
+            import pyarrow.parquet as pq
+
+            obj = self.s3_client.get_object(
+                Bucket=MINIO_BUCKET_SILVER,
+                Key=key
+            )
+
+            # Envolver en BytesIO para que PyArrow pueda realizar búsquedas (seek)
+            buffer = io.BytesIO(obj['Body'].read())
+            parquet_file = pq.read_table(buffer)
+            return parquet_file.to_pandas().to_dict('records')
+        except Exception as e:
+            logger.error(f"Error reading parquet file {key}: {str(e)}")
+            return None
+
+    def write_json(self, bucket: str, key: str, data: List[Dict]):
+        """Escribir datos JSON a MinIO"""
+        try:
+            self.s3_client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=json.dumps(data, default=str),
+                ContentType='application/json'
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error writing JSON to MinIO: {str(e)}")
+            return False
+
+    def read_json(self, bucket: str, prefix: str) -> List[Dict]:
+        """Leer datos JSON desde MinIO"""
+        try:
+            response = self.s3_client.list_objects_v2(
+                Bucket=bucket,
+                Prefix=prefix
+            )
+
+            if 'Contents' not in response:
+                return []
+
+            all_records = []
+            for obj in response['Contents']:
+                if not obj['Key'].endswith('.json'):
+                    continue
+                obj_response = self.s3_client.get_object(
+                    Bucket=bucket,
+                    Key=obj['Key']
+                )
+                content = json.loads(obj_response['Body'].read().decode('utf-8'))
+                if isinstance(content, list):
+                    all_records.extend(content)
+                else:
+                    all_records.append(content)
+
+            return all_records
+        except Exception as e:
+            logger.error(f"Error reading JSON from MinIO: {str(e)}")
+            return []
+
+# ============================================
+# GOLD TRANSFORMER
+# ============================================
+
+class GoldTransformer:
+    def __init__(self):
+        self.s3_client = S3Client()
+        self.last_processed_time = datetime.utcnow()
+
+    def generate_traffic_metrics(self, records: List[Dict]) -> Dict[str, Any]:
+        """Generar métricas de tráfico"""
+        if not records:
+            return {}
+
+        speeds = [r.get('average_speed', 0) for r in records if 'average_speed' in r]
+        densities = [r.get('traffic_density', 0) for r in records if 'traffic_density' in r]
+
+        return {
+            'avg_speed': float(np.mean(speeds)) if speeds else 0,
+            'max_speed': float(np.max(speeds)) if speeds else 0,
+            'min_speed': float(np.min(speeds)) if speeds else 0,
+            'avg_density': float(np.mean(densities)) if densities else 0,
+            'max_density': float(np.max(densities)) if densities else 0,
+            'records_count': len(records)
+        }
+
+    def generate_air_quality_metrics(self, records: List[Dict]) -> Dict[str, Any]:
+        """Generar métricas de calidad del aire"""
+        if not records:
+            return {}
+
+        aqi_values = [r.get('air_quality_index', 0) for r in records if 'air_quality_index' in r]
+        noise_levels = [r.get('noise_level', 0) for r in records if 'noise_level' in r]
+
+        return {
+            'avg_aqi': float(np.mean(aqi_values)) if aqi_values else 0,
+            'max_aqi': float(np.max(aqi_values)) if aqi_values else 0,
+            'min_aqi': float(np.min(aqi_values)) if aqi_values else 0,
+            'avg_noise': float(np.mean(noise_levels)) if noise_levels else 0,
+            'max_noise': float(np.max(noise_levels)) if noise_levels else 0,
+        }
+
+    def generate_traffic_aggregates(self, records: List[Dict]) -> Dict[str, Any]:
+        """Generar agregados de movilidad por minuto, avenida y comuna."""
+        if not records:
+            return {}
+
+        minute_bucket = defaultdict(int)
+        avenue_bucket = defaultdict(int)
+        district_bucket = defaultdict(int)
+
+        for record in records:
+            timestamp = record.get('timestamp')
+            if isinstance(timestamp, datetime):
+                minute_key = timestamp.strftime('%Y-%m-%dT%H:%M')
+            else:
+                minute_key = str(timestamp)[:16] if timestamp else 'unknown'
+
+            vehicle_count = int(record.get('vehicle_count', 0) or 0)
+            avenue = record.get('avenue', 'unknown')
+            district = record.get('district', 'unknown')
+
+            minute_bucket[minute_key] += vehicle_count
+            avenue_bucket[avenue] += vehicle_count
+            district_bucket[district] += vehicle_count
+
+        return {
+            'by_minute': [
+                {'timestamp': ts, 'total_vehicles': total}
+                for ts, total in sorted(minute_bucket.items())
+            ],
+            'by_avenue': [
+                {'avenue': avenue, 'total_vehicles': total}
+                for avenue, total in sorted(avenue_bucket.items())
+            ],
+            'by_district': [
+                {'district': district, 'total_vehicles': total}
+                for district, total in sorted(district_bucket.items())
+            ]
+        }
+
+    def _extract_record_datetime(self, record: Dict[str, Any]) -> Optional[datetime]:
+        """Extraer un datetime válido desde un registro de Silver."""
+        timestamp = record.get('timestamp')
+        if isinstance(timestamp, datetime):
+            return timestamp
+
+        if isinstance(timestamp, str):
+            try:
+                return datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            except Exception:
+                pass
+
+        try:
+            year = record.get('year')
+            month = record.get('month')
+            day = record.get('day')
+            hour = record.get('hour')
+            if all(value is not None for value in (year, month, day, hour)):
+                return datetime(int(year), int(month), int(day), int(hour))
+        except Exception:
+            pass
+
+        return None
+
+    def generate_hourly_aggregates(self, records: List[Dict]) -> List[Dict]:
+        """Generar agregados por hora"""
+        aggregates = defaultdict(list)
+
+        for record in records:
+            timestamp = self._extract_record_datetime(record)
+            if timestamp is None:
+                continue
+
+            key = (
+                timestamp.year,
+                timestamp.month,
+                timestamp.day,
+                timestamp.hour,
+                str(record.get('sensor_type') or 'unknown').lower()
+            )
+            aggregates[key].append(record)
+
+        result = []
+        for (year, month, day, hour, sensor_type), group_records in aggregates.items():
+            if sensor_type == 'traffic':
+                metrics_data = self.generate_traffic_metrics(group_records)
+            elif sensor_type == 'air_quality':
+                metrics_data = self.generate_air_quality_metrics(group_records)
+            else:
+                metrics_data = {'records_count': len(group_records)}
+
+            result.append({
+                'timestamp': datetime(year, month, day, hour).isoformat(),
+                'year': year,
+                'month': month,
+                'day': day,
+                'hour': hour,
+                'sensor_type': sensor_type,
+                'metrics': metrics_data,
+                'record_count': len(group_records)
+            })
+
+        return result
+
+    def generate_incident_reports(self, records: List[Dict]) -> List[Dict]:
+        """Generar reportes de incidentes"""
+        incidents = [r for r in records if r.get('incident_detected', False)]
+
+        return [
+            {
+                'timestamp': r.get('timestamp').isoformat() if hasattr(r.get('timestamp'), 'isoformat') else r.get('timestamp'),
+                'sensor_id': r.get('sensor_id'),
+                'sensor_type': r.get('sensor_type'),
+                'incident_type': r.get('incident_type'),
+                'location': {
+                    'latitude': r.get('latitude'),
+                    'longitude': r.get('longitude')
+                },
+                'intersection': r.get('intersection')
+            }
+            for r in incidents
+        ]
+
+    def transform_and_load(self):
+        """Transformar datos de Silver a Gold y almacenar en MinIO"""
+        transformation_runs.add(1)
+        start_time = time.time()
+
+        try:
+            with tracer.start_as_current_span("transform_to_gold"):
+                logger.info("Starting Gold transformation")
+
+                # 1. Listar los archivos Parquet reales desde el bucket Silver en MinIO
+                parquet_files = self.s3_client.list_parquet_files("processed/")
+                
+                if not parquet_files:
+                    logger.warning("No se encontraron archivos Parquet en la capa Silver (s3://silver/processed/)")
+                    return
+
+                # 2. Leer y consolidar los registros de todos los archivos encontrados
+                silver_records = []
+                for file_key in parquet_files:
+                    records = self.s3_client.read_parquet_file(file_key)
+                    if records:
+                        silver_records.extend(records)
+
+                if not silver_records:
+                    logger.warning("Los archivos Parquet se leyeron pero no contienen registros válidos")
+                    return
+
+                logger.info(f"Se cargaron {len(silver_records)} registros reales desde la capa Silver para transformar")
+
+                now = datetime.utcnow()
+                date_str = now.strftime("%Y-%m-%d")
+
+                # 3. Generar agregados por hora
+                hourly_aggregates = self.generate_hourly_aggregates(silver_records)
+                if hourly_aggregates:
+                    key = f"hourly_metrics/date={date_str}/{int(time.time() * 1000)}.json"
+                    if self.s3_client.write_json(MINIO_BUCKET_GOLD, key, hourly_aggregates):
+                        documents_created.add(len(hourly_aggregates))
+                        logger.info(f"Wrote {len(hourly_aggregates)} hourly metrics to gold/{key}")
+                        statsd_client.increment('documents.inserted', len(hourly_aggregates))
+
+                traffic_aggregates = self.generate_traffic_aggregates(silver_records)
+                if traffic_aggregates:
+                    key = f"traffic_metrics/date={date_str}/{int(time.time() * 1000)}.json"
+                    if self.s3_client.write_json(MINIO_BUCKET_GOLD, key, [traffic_aggregates]):
+                        documents_created.add(1)
+                        logger.info(f"Wrote traffic aggregates to gold/{key}")
+                        statsd_client.increment('documents.inserted', 1)
+
+                # 4. Generar reportes de incidentes
+                incident_reports = self.generate_incident_reports(silver_records)
+                if incident_reports:
+                    key = f"incident_reports/date={date_str}/{int(time.time() * 1000)}.json"
+                    if self.s3_client.write_json(MINIO_BUCKET_GOLD, key, incident_reports):
+                        documents_created.add(len(incident_reports))
+                        logger.info(f"Wrote {len(incident_reports)} incident reports to gold/{key}")
+                        statsd_client.increment('documents.inserted', len(incident_reports))
+
+                elapsed = time.time() - start_time
+                transformation_duration.record(elapsed)
+                statsd_client.histogram('transformation.duration_seconds', elapsed)
+
+                logger.info(f"Gold transformation completed in {elapsed:.2f} seconds")
+
+        except Exception as e:
+            logger.error(f"Critical error in transformation: {str(e)}")
+            statsd_client.increment('transformation.failed')
+
+    def _generate_sample_records(self) -> List[Dict]:
+        """Generar registros de ejemplo (simular lectura de Parquet)"""
+        import random
+        from datetime import datetime
+
+        now = datetime.utcnow()
+        records = []
+
+        for i in range(100):
+            records.append({
+                'sensor_id': f'SENSOR_{random.randint(1, 100):04d}',
+                'sensor_type': random.choice(['traffic', 'air_quality', 'noise']),
+                'year': now.year,
+                'month': now.month,
+                'day': now.day,
+                'hour': now.hour,
+                'latitude': -12.0462 + (random.random() - 0.5) * 0.1,
+                'longitude': -77.0371 + (random.random() - 0.5) * 0.1,
+                'average_speed': random.uniform(20, 80),
+                'traffic_density': random.uniform(0, 100),
+                'air_quality_index': random.uniform(0, 300),
+                'noise_level': random.uniform(40, 90),
+                'incident_detected': random.random() > 0.95,
+                'incident_type': random.choice(['accident', 'congestion', 'breakdown', 'none']),
+                'intersection': f'INT_{random.randint(1, 50):04d}',
+                'timestamp': datetime(now.year, now.month, now.day, now.hour)
+            })
+
+        return records
+
+    def run_scheduler(self):
+        """Ejecutar scheduler de transformación"""
+        while True:
+            try:
+                self.transform_and_load()
+            except Exception as e:
+                logger.error(f"Error in transformation scheduler: {str(e)}")
+
+            time.sleep(600)  # 10 minutos
+
+
+# ============================================
+# MAIN
+# ============================================
+
+if __name__ == "__main__":
+    transformer = GoldTransformer()
+    transformer.run_scheduler()
+</file>
+
 <file path="etl/otel_setup.py">
 import logging
 import os
@@ -7155,6 +6580,554 @@ def configure_observability(
     meter = metrics.get_meter(service_name)
     tracer = trace.get_tracer(service_name)
     return meter, tracer, logger_provider
+</file>
+
+<file path="etl/requirements_gold.txt">
+boto3==1.28.0
+pyarrow==16.0.0
+pandas==2.2.3
+numpy==2.1.3
+opentelemetry-api==1.31.0
+opentelemetry-sdk==1.31.0
+opentelemetry-exporter-otlp-proto-http==1.31.0
+opentelemetry-instrumentation==0.52b0
+python-statsd==2.1.0
+</file>
+
+<file path="fastapi_service/main.py">
+import json
+import logging
+import os
+import time
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+
+import boto3
+from fastapi import FastAPI, Query, HTTPException
+from pydantic import BaseModel
+from opentelemetry import metrics, trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+
+try:
+    from statsd import StatsClient as _StatsClient
+except Exception:
+    try:
+        from statsd.client import StatsClient as _StatsClient
+    except Exception:
+        _StatsClient = None
+
+import uvicorn
+
+from otel_setup import configure_observability
+
+
+class _NoOpStatsClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def increment(self, *args, **kwargs):
+        return None
+
+    def gauge(self, *args, **kwargs):
+        return None
+
+    def histogram(self, *args, **kwargs):
+        return None
+
+
+def _build_statsd_client(prefix: str):
+    if _StatsClient is None:
+        return _NoOpStatsClient()
+
+    try:
+        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
+    except Exception:
+        return _NoOpStatsClient()
+
+# ============================================
+# LOGGING
+# ============================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# OBSERVABILIDAD
+# ============================================
+
+meter, tracer, _ = configure_observability("fastapi")
+
+RequestsInstrumentor().instrument()
+
+statsd_client = _build_statsd_client('fastapi')
+
+# ============================================
+# MÉTRICAS
+# ============================================
+
+requests_total = meter.create_counter(
+    name="requests_total",
+    description="Total requests",
+    unit="1"
+)
+
+request_duration = meter.create_histogram(
+    name="request_duration_ms",
+    description="Request duration",
+    unit="ms"
+)
+
+# ============================================
+# CONFIGURACIÓN
+# ============================================
+
+MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', 'minio:9000')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+MINIO_BUCKET_GOLD = os.getenv('MINIO_BUCKET_GOLD', 'gold')
+
+# ============================================
+# MODELOS
+# ============================================
+
+class HealthResponse(BaseModel):
+    status: str
+    timestamp: str
+    service: str
+
+class MetricValue(BaseModel):
+    avg_speed: Optional[float] = None
+    max_speed: Optional[float] = None
+    min_speed: Optional[float] = None
+    avg_density: Optional[float] = None
+    max_density: Optional[float] = None
+    avg_aqi: Optional[float] = None
+    max_aqi: Optional[float] = None
+    records_count: Optional[int] = None
+
+class HourlyMetric(BaseModel):
+    timestamp: str
+    year: int
+    month: int
+    day: int
+    hour: int
+    sensor_type: str
+    metrics: MetricValue
+    record_count: int
+
+class Location(BaseModel):
+    latitude: float
+    longitude: float
+
+class IncidentReport(BaseModel):
+    timestamp: str
+    sensor_id: str
+    sensor_type: str
+    incident_type: str
+    location: Location
+    intersection: str
+
+# ============================================
+# CLIENTE MINIO (Gold Layer)
+# ============================================
+
+class MinIOClient:
+    def __init__(self):
+        self.s3_client = boto3.client(
+            's3',
+            endpoint_url=f'http://{MINIO_ENDPOINT}',
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            region_name='us-east-1'
+        )
+        self.bucket = MINIO_BUCKET_GOLD
+
+    def read_all_json(self, prefix: str) -> List[Dict]:
+        """Leer todos los archivos JSON de un prefijo en MinIO"""
+        try:
+            response = self.s3_client.list_objects_v2(
+                Bucket=self.bucket,
+                Prefix=prefix
+            )
+
+            if 'Contents' not in response:
+                return []
+
+            all_records = []
+            for obj in response['Contents']:
+                if not obj['Key'].endswith('.json'):
+                    continue
+                obj_response = self.s3_client.get_object(
+                    Bucket=self.bucket,
+                    Key=obj['Key']
+                )
+                content = json.loads(obj_response['Body'].read().decode('utf-8'))
+                if isinstance(content, list):
+                    all_records.extend(content)
+                elif isinstance(content, dict):
+                    all_records.append(content)
+
+            return all_records
+        except Exception as e:
+            logger.error(f"Error reading from MinIO: {str(e)}")
+            return []
+
+    def health_check(self) -> bool:
+        """Verificar conectividad con MinIO"""
+        try:
+            self.s3_client.head_bucket(Bucket=self.bucket)
+            return True
+        except Exception:
+            return False
+
+# ============================================
+# FASTAPI APP
+# ============================================
+
+app = FastAPI(
+    title="Data Platform API",
+    description="Gold Layer API - Read-only access to processed data from MinIO",
+    version="2.0.0"
+)
+
+# Variable global para el cliente MinIO
+minio_client: Optional[MinIOClient] = None
+
+FastAPIInstrumentor.instrument_app(app)
+
+@app.on_event("startup")
+async def startup_event():
+    """Inicializar conexión a MinIO"""
+    global minio_client
+    try:
+        minio_client = MinIOClient()
+        logger.info("API started successfully - connected to MinIO gold layer")
+    except Exception as e:
+        logger.error(f"Failed to initialize MinIO client: {str(e)}")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cerrar cliente (sin efecto real para S3, pero mantenemos la estructura)"""
+    global minio_client
+    logger.info("API shutdown successfully")
+
+# ============================================
+# HEALTH CHECK
+# ============================================
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint"""
+    start_time = time.time()
+
+    try:
+        with tracer.start_as_current_span("health_check"):
+            requests_total.add(1)
+
+            if not minio_client.health_check():
+                raise HTTPException(status_code=503, detail="MinIO not available")
+
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+
+            return {
+                "status": "healthy",
+                "timestamp": datetime.utcnow().isoformat(),
+                "service": "data-platform-api"
+            }
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        raise HTTPException(status_code=503, detail="Service unavailable")
+
+@app.get("/readiness")
+async def readiness_check():
+    """Readiness check endpoint"""
+    try:
+        if minio_client.health_check():
+            return {"status": "ready"}
+        raise Exception("MinIO not ready")
+    except Exception:
+        raise HTTPException(status_code=503, detail="Not ready")
+
+# ============================================
+# ENDPOINTS - HOURLY METRICS
+# ============================================
+
+@app.get("/api/v1/metrics/hourly", response_model=List[HourlyMetric])
+async def get_hourly_metrics(
+    sensor_type: Optional[str] = Query(None),
+    hours: int = Query(24, ge=1, le=720),
+    limit: int = Query(1000, ge=1, le=10000)
+):
+    """Obtener métricas por hora desde MinIO Gold"""
+    start_time = time.time()
+
+    try:
+        with tracer.start_as_current_span("get_hourly_metrics"):
+            requests_total.add(1)
+
+            # Leer todos los datos de hourly_metrics desde MinIO
+            all_records = minio_client.read_all_json("hourly_metrics/")
+
+            # Filtrar por tipo de sensor
+            if sensor_type:
+                all_records = [r for r in all_records if r.get('sensor_type', '').lower() == sensor_type.lower()]
+
+            # Filtrar por las últimas N horas
+            since = datetime.utcnow() - timedelta(hours=hours)
+            filtered = []
+            for r in all_records:
+                try:
+                    ts = datetime.fromisoformat(r['timestamp'])
+                    if ts >= since:
+                        filtered.append(r)
+                except (KeyError, ValueError):
+                    continue
+
+            # Ordenar por timestamp descendente y limitar
+            filtered.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            results = filtered[:limit]
+
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+            statsd_client.histogram('endpoint.hourly_metrics.duration_ms', elapsed)
+
+            return results
+    except Exception as e:
+        logger.error(f"Error fetching hourly metrics: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================
+# ENDPOINTS - INCIDENT REPORTS
+# ============================================
+
+@app.get("/api/v1/incidents", response_model=List[IncidentReport])
+async def get_incidents(
+    incident_type: Optional[str] = Query(None),
+    hours: int = Query(24, ge=1, le=720),
+    limit: int = Query(1000, ge=1, le=10000)
+):
+    """Obtener reportes de incidentes desde MinIO Gold"""
+    start_time = time.time()
+
+    try:
+        with tracer.start_as_current_span("get_incidents"):
+            requests_total.add(1)
+
+            # Leer todos los datos de incident_reports desde MinIO
+            all_records = minio_client.read_all_json("incident_reports/")
+
+            # Filtrar por tipo de incidente
+            if incident_type:
+                all_records = [r for r in all_records if r.get('incident_type', '').lower() == incident_type.lower()]
+
+            # Filtrar por las últimas N horas
+            since = datetime.utcnow() - timedelta(hours=hours)
+            filtered = []
+            for r in all_records:
+                try:
+                    ts = datetime.fromisoformat(r['timestamp'])
+                    if ts >= since:
+                        filtered.append(r)
+                except (KeyError, ValueError):
+                    continue
+
+            # Ordenar por timestamp descendente y limitar
+            filtered.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            results = filtered[:limit]
+
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+            statsd_client.histogram('endpoint.incidents.duration_ms', elapsed)
+
+            return results
+    except Exception as e:
+        logger.error(f"Error fetching incidents: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================
+# ENDPOINTS - AGGREGATIONS
+# ============================================
+
+@app.get("/api/v1/aggregations/by-sensor-type")
+async def get_aggregations_by_sensor_type(hours: int = Query(24, ge=1, le=720)):
+    """Obtener agregaciones por tipo de sensor desde MinIO Gold"""
+    start_time = time.time()
+
+    try:
+        with tracer.start_as_current_span("get_aggregations"):
+            requests_total.add(1)
+
+            # Leer todos los datos de hourly_metrics
+            all_records = minio_client.read_all_json("hourly_metrics/")
+
+            # Filtrar por las últimas N horas
+            since = datetime.utcnow() - timedelta(hours=hours)
+            filtered = []
+            for r in all_records:
+                try:
+                    ts = datetime.fromisoformat(r['timestamp'])
+                    if ts >= since:
+                        filtered.append(r)
+                except (KeyError, ValueError):
+                    continue
+
+            # Agrupar por tipo de sensor
+            groups: Dict[str, List[Dict]] = {}
+            for r in filtered:
+                st = r.get('sensor_type', 'unknown')
+                if st not in groups:
+                    groups[st] = []
+                groups[st].append(r)
+
+            # Calcular agregaciones
+            aggregations = []
+            for sensor_type, records in groups.items():
+                total_records = sum(r.get('record_count', 0) for r in records)
+                avg_records = total_records / len(records) if records else 0
+
+                aggregations.append({
+                    'sensor_type': sensor_type,
+                    'avg_records': round(avg_records, 2),
+                    'total_records': total_records,
+                    'count': len(records)
+                })
+
+            # Ordenar por total_records descendente
+            aggregations.sort(key=lambda x: x['total_records'], reverse=True)
+
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+
+            return {'aggregations': aggregations}
+    except Exception as e:
+        logger.error(f"Error fetching aggregations: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================
+# ENDPOINTS - STATS
+# ============================================
+
+@app.get("/api/v1/traffic/by-minute")
+async def get_traffic_by_minute(hours: int = Query(24, ge=1, le=720)):
+    """Obtener vehículos por minuto desde Gold."""
+    start_time = time.time()
+    try:
+        with tracer.start_as_current_span("get_traffic_by_minute"):
+            requests_total.add(1)
+            records = minio_client.read_all_json("traffic_metrics/")
+            filtered = []
+            for item in records:
+                if not isinstance(item, dict):
+                    continue
+                payload = item.get('by_minute', [])
+                if isinstance(payload, list):
+                    filtered.extend(payload)
+            since = datetime.utcnow() - timedelta(hours=hours)
+            filtered = [
+                r for r in filtered
+                if isinstance(r.get('timestamp'), str) and datetime.fromisoformat(r['timestamp'].replace('Z', '+00:00')) >= since
+            ]
+            filtered.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+            statsd_client.histogram('endpoint.traffic_by_minute.duration_ms', elapsed)
+            return filtered
+    except Exception as e:
+        logger.error(f"Error fetching traffic by minute: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/traffic/by-avenue")
+async def get_traffic_by_avenue(hours: int = Query(24, ge=1, le=720)):
+    """Obtener vehículos por avenida desde Gold."""
+    start_time = time.time()
+    try:
+        with tracer.start_as_current_span("get_traffic_by_avenue"):
+            requests_total.add(1)
+            records = minio_client.read_all_json("traffic_metrics/")
+            filtered = []
+            for item in records:
+                if not isinstance(item, dict):
+                    continue
+                payload = item.get('by_avenue', [])
+                if isinstance(payload, list):
+                    filtered.extend(payload)
+            filtered.sort(key=lambda x: x.get('total_vehicles', 0), reverse=True)
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+            statsd_client.histogram('endpoint.traffic_by_avenue.duration_ms', elapsed)
+            return filtered
+    except Exception as e:
+        logger.error(f"Error fetching traffic by avenue: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/traffic/by-district")
+async def get_traffic_by_district(hours: int = Query(24, ge=1, le=720)):
+    """Obtener vehículos por comuna desde Gold."""
+    start_time = time.time()
+    try:
+        with tracer.start_as_current_span("get_traffic_by_district"):
+            requests_total.add(1)
+            records = minio_client.read_all_json("traffic_metrics/")
+            filtered = []
+            for item in records:
+                if not isinstance(item, dict):
+                    continue
+                payload = item.get('by_district', [])
+                if isinstance(payload, list):
+                    filtered.extend(payload)
+            filtered.sort(key=lambda x: x.get('total_vehicles', 0), reverse=True)
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+            statsd_client.histogram('endpoint.traffic_by_district.duration_ms', elapsed)
+            return filtered
+    except Exception as e:
+        logger.error(f"Error fetching traffic by district: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/stats/database")
+async def get_database_stats():
+    """Obtener estadísticas de la base de datos (Gold layer en MinIO)"""
+    start_time = time.time()
+
+    try:
+        with tracer.start_as_current_span("get_db_stats"):
+            requests_total.add(1)
+
+            hourly_metrics = minio_client.read_all_json("hourly_metrics/")
+            incidents = minio_client.read_all_json("incident_reports/")
+
+            stats = {
+                'hourly_metrics_count': len(hourly_metrics),
+                'incidents_count': len(incidents),
+                'timestamp': datetime.utcnow().isoformat(),
+                'storage': 'minio_gold'
+            }
+
+            elapsed = (time.time() - start_time) * 1000
+            request_duration.record(elapsed)
+
+            return stats
+    except Exception as e:
+        logger.error(f"Error fetching database stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================
+# MAIN
+# ============================================
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
 </file>
 
 <file path="fastapi_service/otel_setup.py">
@@ -7244,6 +7217,20 @@ def configure_observability(
     return meter, tracer, logger_provider
 </file>
 
+<file path="fastapi_service/requirements.txt">
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+boto3==1.28.0
+pydantic==2.9.2
+opentelemetry-api==1.31.0
+opentelemetry-sdk==1.31.0
+opentelemetry-exporter-otlp-proto-http==1.31.0
+opentelemetry-instrumentation-fastapi==0.52b0
+opentelemetry-instrumentation-requests==0.52b0
+opentelemetry-instrumentation==0.52b0
+python-statsd==2.1.0
+</file>
+
 <file path="generator/otel_setup.py">
 import logging
 import os
@@ -7329,6 +7316,361 @@ def configure_observability(
     meter = metrics.get_meter(service_name)
     tracer = trace.get_tracer(service_name)
     return meter, tracer, logger_provider
+</file>
+
+<file path="QUICKSTART.sh">
+#!/bin/bash
+
+# ============================================
+# QUICK START - Data Platform MVP
+# ============================================
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║   Data Platform MVP - Data Engineering Architecture       ║"
+echo "║   Medallion Architecture with Full Observability          ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+# Verificar Docker
+echo "📦 Verificando requisitos..."
+if ! command -v docker &> /dev/null; then
+    echo "❌ Docker no está instalado. Por favor instalar Docker Desktop."
+    exit 1
+fi
+
+if ! command -v docker compose &> /dev/null; then
+    echo "❌ Docker Compose no está instalado."
+    exit 1
+fi
+
+echo "✅ Docker instalado"
+echo ""
+
+# Mostrar servicios
+echo "🚀 Iniciando servicios..."
+echo ""
+echo "Servicios que se levantarán:"
+echo "  ✓ Zookeeper (2181)"
+echo "  ✓ Kafka (9092)"
+echo "  ✓ MinIO S3 (9000, 9001)"
+echo "  ✓ Datadog Agent (8126)"
+echo "  ✓ Data Generator"
+echo "  ✓ Streaming Worker (Bronze)"
+echo "  ✓ ETL Spark (Silver)"
+echo "  ✓ Gold Transformer (Gold)"
+echo "  ✓ FastAPI (8000)"
+echo "  ✓ Nginx Proxy (80, 443)"
+echo ""
+
+# Levantar servicios
+docker compose up -d
+
+echo "⏳ Esperando servicios para iniciar (30 segundos)..."
+sleep 30
+
+# Verificar salud
+echo ""
+echo "🏥 Verificando salud de servicios..."
+
+HEALTHY=0
+TOTAL=10
+
+# Verificar FastAPI
+if curl -s http://localhost/health > /dev/null 2>&1; then
+    echo "  ✅ FastAPI API"
+    HEALTHY=$((HEALTHY + 1))
+else
+    echo "  ⏳ FastAPI (iniciando...)"
+fi
+
+# Verificar Kafka
+if docker compose exec -T kafka kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1; then
+    echo "  ✅ Kafka"
+    HEALTHY=$((HEALTHY + 1))
+else
+    echo "  ⏳ Kafka (iniciando...)"
+fi
+
+# Verificar MinIO
+if curl -s http://localhost:9000/minio/health/live > /dev/null 2>&1; then
+    echo "  ✅ MinIO"
+    HEALTHY=$((HEALTHY + 1))
+else
+    echo "  ⏳ MinIO (iniciando...)"
+fi
+
+echo ""
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║              PLATAFORMA INICIADA EXITOSAMENTE             ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "📊 ACCESO A SERVICIOS:"
+echo ""
+echo "  🌐 API Docs (FastAPI):"
+echo "     http://localhost/docs"
+echo ""
+echo "  🪣 MinIO Console:"
+echo "     http://localhost:9001"
+echo "     Credenciales: minioadmin / minioadmin"
+echo ""
+echo "  Capas de datos (todo en MinIO):"
+echo "     - Bronze: datos crudos (JSON)"
+echo "     - Silver: datos limpios (Parquet)"
+echo "     - Gold: métricas e incidentes (JSON)"
+echo ""
+echo "  📈 Datadog (si está configurado):"
+echo "     https://app.datadoghq.com"
+echo ""
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                    PRÓXIMOS PASOS                          ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "1️⃣  VER LOGS DE GENERADOR:"
+echo "    docker compose logs -f generator"
+echo ""
+
+echo "2️⃣  VERIFICAR ESTADO:"
+echo "    docker compose ps"
+echo ""
+
+echo "3️⃣  PROBAR API:"
+echo "    curl http://localhost/health"
+echo ""
+
+echo "4️⃣  VERIFICAR DATOS EN BRONZE:"
+echo "    docker compose exec minio mc ls local/bronze/raw"
+echo ""
+
+echo "5️⃣  CONSULTAR GOLD (MinIO):"
+echo "    docker compose exec minio mc ls local/gold/hourly_metrics/"
+echo ""
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                    DOCUMENTACIÓN                           ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "📚 Documentación Disponible:"
+echo "   - README.md              : Guía general"
+echo "   - docs/Architecture.md   : Arquitectura detallada"
+echo "   - docs/Pipeline.md       : Flujo de datos"
+echo "   - docs/Medallion.md      : Patrón Medallion"
+echo "   - docs/Observability.md  : Monitoreo y métricas"
+echo "   - docs/Deployment.md     : Despliegue y escalado"
+echo "   - docs/ADR.md            : Decisiones arquitectónicas"
+echo "   - docs/Testing.md        : Guía de testing"
+echo ""
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                   DATADOG (OPCIONAL)                       ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "Para habilitar Datadog:"
+echo ""
+echo "  export DD_API_KEY='tu_api_key_aqui'"
+echo "  docker compose restart datadog-agent"
+echo ""
+echo "  Luego acceder a: https://app.datadoghq.com"
+echo ""
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                   PARAR LA PLATAFORMA                      ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "  docker compose down"
+echo ""
+
+echo "📝 Para limpiar datos:"
+echo "  bash scripts/clean.sh"
+echo ""
+
+echo "✅ ¡Plataforma lista para usar!"
+</file>
+
+<file path="scripts/clean.sh">
+#!/bin/bash
+
+# Script para limpiar la plataforma
+
+echo "¿Estás seguro de que deseas limpiar todos los datos? (s/n)"
+read -r response
+
+if [ "$response" != "s" ]; then
+    echo "Cancelado"
+    exit 0
+fi
+
+echo "Deteniendo servicios..."
+docker compose down
+
+echo "Eliminando volúmenes..."
+docker volume rm \
+    et-ingenier-a-de-datos_minio_data \
+    et-ingenier-a-de-datos_datadog_socket || true
+
+echo "Eliminando directorios de datos..."
+rm -rf data/{bronze,silver,gold}/*
+
+echo "✓ Limpieza completada"
+</file>
+
+<file path="scripts/init.sh">
+#!/bin/bash
+
+# Script de inicialización de la plataforma
+# Uso: bash init.sh
+
+set -e
+
+echo "================================"
+echo "Data Platform - Initialization"
+echo "================================"
+
+# Colores
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+# Verificar Docker
+echo -e "${YELLOW}[1/5] Verificando Docker...${NC}"
+if ! command -v docker &> /dev/null; then
+    echo -e "${RED}Error: Docker no está instalado${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Docker OK${NC}"
+
+# Verificar Docker Compose
+echo -e "${YELLOW}[2/5] Verificando Docker Compose...${NC}"
+if ! command -v docker compose &> /dev/null; then
+    echo -e "${RED}Error: Docker Compose no está instalado${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Docker Compose OK${NC}"
+
+# Crear directorios necesarios
+echo -e "${YELLOW}[3/5] Creando directorios...${NC}"
+mkdir -p data/{bronze,silver,gold,minio}
+echo -e "${GREEN}✓ Directorios creados${NC}"
+
+# Configurar variables de entorno
+echo -e "${YELLOW}[4/5] Configurando variables de entorno...${NC}"
+if [ ! -f .env ]; then
+    cat > .env << EOF
+# Datadog
+DD_API_KEY=test_key_local_only
+
+# Kafka
+KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+KAFKA_TOPIC=raw_events
+
+# MinIO
+MINIO_ENDPOINT=minio:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+
+# Gold (MinIO buckets)
+MINIO_BUCKET_BRONZE=bronze
+MINIO_BUCKET_SILVER=silver
+MINIO_BUCKET_GOLD=gold
+EOF
+    echo -e "${GREEN}✓ Archivo .env creado${NC}"
+else
+    echo -e "${GREEN}✓ Archivo .env ya existe${NC}"
+fi
+
+# Levantar servicios
+echo -e "${YELLOW}[5/5] Levantando servicios Docker...${NC}"
+docker compose up -d
+
+echo ""
+echo -e "${GREEN}================================${NC}"
+echo -e "${GREEN}Inicialización completada!${NC}"
+echo -e "${GREEN}================================${NC}"
+echo ""
+echo "Servicios en ejecución:"
+echo "  - Zookeeper: localhost:2181"
+echo "  - Kafka: localhost:9092"
+echo "  - MinIO: http://localhost:9000"
+echo "  - MinIO Console: http://localhost:9001"
+echo "  - FastAPI Docs: http://localhost/docs"
+echo "  - Datadog Agent: localhost:8126"
+echo ""
+echo "Capas de datos (todo en MinIO):"
+echo "  - Bronze: eventos crudos desde Kafka"
+echo "  - Silver: datos limpios y enriquecidos (Parquet)"
+echo "  - Gold: métricas agregadas e incidentes (JSON)"
+echo ""
+echo "Credenciales MinIO: minioadmin / minioadmin"
+echo ""
+echo "Próximos pasos:"
+echo "  1. Verificar servicios: docker compose ps"
+echo "  2. Ver logs: docker compose logs -f"
+echo "  3. Consultar API: curl http://localhost/health"
+echo ""
+echo "Para usar Datadog:"
+echo "  export DD_API_KEY='your_real_api_key'"
+echo "  docker compose restart datadog-agent"
+echo ""
+</file>
+
+<file path="scripts/test.sh">
+#!/bin/bash
+
+# Script para ejecutar pruebas en la plataforma
+
+echo "================================"
+echo "Testing Data Platform"
+echo "================================"
+echo ""
+
+# Test 1: Health Check
+echo "[Test 1] Health Check..."
+curl -s http://localhost/health | jq .
+echo ""
+
+# Test 2: Generate test event
+echo "[Test 2] Verificar generador de eventos..."
+docker compose logs generator | grep "Batch produced" | tail -1
+echo ""
+
+# Test 3: Check Kafka topic
+echo "[Test 3] Verificar Kafka..."
+docker compose exec kafka kafka-consumer-groups.sh \
+    --bootstrap-server localhost:9092 \
+    --group bronze_workers \
+    --describe 2>/dev/null || echo "No consumer group info available"
+echo ""
+
+# Test 4: Check MinIO buckets
+echo "[Test 4] Verificar MinIO buckets..."
+docker compose exec minio mc ls local/bronze 2>/dev/null || echo "No bronze data yet"
+echo ""
+
+# Test 5: Check MinIO Gold layer (replaces MongoDB)
+echo "[Test 5] Verificar MinIO (Gold/processed data)..."
+docker compose exec minio mc ls local/gold 2>/dev/null || echo "No gold data yet"
+echo ""
+
+# Test 6: API endpoints
+echo "[Test 6] Probar API endpoints..."
+echo "GET /api/v1/stats/database"
+curl -s http://localhost/api/v1/stats/database | jq .
+echo ""
+
+# Test 7: Request a metrics
+echo "[Test 7] Probar GET /api/v1/metrics/hourly..."
+curl -s "http://localhost/api/v1/metrics/hourly?limit=1" | jq . | head -20
+echo ""
+
+echo "================================"
+echo "Testing completado!"
+echo "================================"
 </file>
 
 <file path="streaming_worker/otel_setup.py">

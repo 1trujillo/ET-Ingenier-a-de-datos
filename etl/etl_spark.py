@@ -10,7 +10,7 @@ from pyspark.sql import SparkSession, Window
 from pyspark.sql.functions import (
     col, when, round as spark_round, lower, trim, coalesce,
     year, month, dayofmonth, hour, avg, max as spark_max, min as spark_min,
-    row_number, first, last, count, sum as spark_sum
+    row_number, first, last, count, sum as spark_sum, to_timestamp
 )
 from opentelemetry import metrics, trace
 
@@ -180,7 +180,7 @@ class SparkETL:
             # Validar campos requeridos
             required_fields = [
                 'sensor_id', 'sensor_type', 'latitude', 'longitude',
-                'timestamp', 'vehicle_count', 'average_speed'
+                'timestamp', 'vehicle_count', 'average_speed', 'avenue', 'district'
             ]
             
             for field in required_fields:
@@ -189,6 +189,17 @@ class SparkETL:
             # Limpiar strings
             df = df.withColumn('sensor_id', trim(lower(col('sensor_id'))))
             df = df.withColumn('sensor_type', trim(lower(col('sensor_type'))))
+            df = df.withColumn('avenue', trim(col('avenue')))
+            df = df.withColumn('district', trim(col('district')))
+
+            df = df.withColumn('vehicle_count', col('vehicle_count').cast('int'))
+            df = df.withColumn('average_speed', col('average_speed').cast('double'))
+            df = df.withColumn('traffic_density', col('traffic_density').cast('double'))
+            df = df.withColumn('air_quality_index', col('air_quality_index').cast('double'))
+            df = df.withColumn('latitude', col('latitude').cast('double'))
+            df = df.withColumn('longitude', col('longitude').cast('double'))
+            df = df.withColumn('timestamp_parsed', to_timestamp(col('timestamp')))
+            df = df.filter(col('timestamp_parsed').isNotNull())
             
             # Validar rangos
             df = df.filter(
@@ -226,10 +237,10 @@ class SparkETL:
             )
             
             # Extraer componentes de timestamp
-            df = df.withColumn('year', year(col('timestamp')))
-            df = df.withColumn('month', month(col('timestamp')))
-            df = df.withColumn('day', dayofmonth(col('timestamp')))
-            df = df.withColumn('hour', hour(col('timestamp')))
+            df = df.withColumn('year', year(col('timestamp_parsed')))
+            df = df.withColumn('month', month(col('timestamp_parsed')))
+            df = df.withColumn('day', dayofmonth(col('timestamp_parsed')))
+            df = df.withColumn('hour', hour(col('timestamp_parsed')))
             
             # Redondear valores numéricos
             df = df.withColumn('latitude', spark_round(col('latitude'), 4))

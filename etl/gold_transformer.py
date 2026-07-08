@@ -86,6 +86,18 @@ transformation_duration = meter.create_histogram(
     unit="s"
 )
 
+alert_generation_latency = meter.create_histogram(
+    name="alert_generation_latency_ms",
+    description="Time to generate incident reports and write to Gold",
+    unit="ms"
+)
+
+accidents_by_district = meter.create_counter(
+    name="movilidad.accidentes_por_comuna",
+    description="Accident incidents by district",
+    unit="1"
+)
+
 # ============================================
 # CONFIGURACIÓN
 # ============================================
@@ -345,20 +357,33 @@ class GoldTransformer:
         """Generar reportes de incidentes"""
         incidents = [r for r in records if r.get('incident_detected', False)]
 
-        return [
-            {
+        reports = []
+        for r in incidents:
+            incident_type = r.get('incident_type', 'unknown')
+            district = r.get('district', 'unknown')
+
+            # --- NEW: accidentes_por_comuna ---
+            if incident_type == 'accident':
+                accidents_by_district.add(1, attributes={'district': district})
+                try:
+                    statsd_client.increment('movilidad.accidentes_por_comuna', tags=[f'district:{district}'])
+                except TypeError:
+                    statsd_client.increment('movilidad.accidentes_por_comuna')
+
+            reports.append({
                 'timestamp': r.get('timestamp').isoformat() if hasattr(r.get('timestamp'), 'isoformat') else r.get('timestamp'),
                 'sensor_id': r.get('sensor_id'),
                 'sensor_type': r.get('sensor_type'),
-                'incident_type': r.get('incident_type'),
+                'incident_type': incident_type,
+                'district': district,
                 'location': {
                     'latitude': r.get('latitude'),
                     'longitude': r.get('longitude')
                 },
                 'intersection': r.get('intersection')
-            }
-            for r in incidents
-        ]
+            })
+
+        return reports
 
     def transform_and_load(self):
         """Transformar datos de Silver a Gold y almacenar en MinIO"""
@@ -409,7 +434,8 @@ class GoldTransformer:
                         logger.info(f"Wrote traffic aggregates to gold/{key}")
                         statsd_client.increment('documents.inserted', 1)
 
-                # 4. Generar reportes de incidentes
+                # 4. Generar reportes de incidentes (con medición de latencia)
+                alert_start_time = time.time()
                 incident_reports = self.generate_incident_reports(silver_records)
                 if incident_reports:
                     key = f"incident_reports/date={date_str}/{int(time.time() * 1000)}.json"
@@ -417,6 +443,12 @@ class GoldTransformer:
                         documents_created.add(len(incident_reports))
                         logger.info(f"Wrote {len(incident_reports)} incident reports to gold/{key}")
                         statsd_client.increment('documents.inserted', len(incident_reports))
+                alert_elapsed_ms = (time.time() - alert_start_time) * 1000
+                alert_generation_latency.record(alert_elapsed_ms)
+                try:
+                    statsd_client.histogram('alert_generation_latency_ms', alert_elapsed_ms)
+                except Exception:
+                    pass
 
                 elapsed = time.time() - start_time
                 transformation_duration.record(elapsed)

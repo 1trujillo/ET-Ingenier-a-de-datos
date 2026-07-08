@@ -90,6 +90,24 @@ processing_latency = meter.create_histogram(
     unit="ms"
 )
 
+pipeline_success_rate = meter.create_gauge(
+    name="pipeline.success_rate_pct",
+    description="Percentage of events successfully processed per batch",
+    unit="%"
+)
+
+pipeline_throughput = meter.create_gauge(
+    name="pipeline.throughput.events_per_min",
+    description="Processing throughput normalized to events per minute",
+    unit="events/min"
+)
+
+recovery_time = meter.create_histogram(
+    name="service.recovery_time_ms",
+    description="Time to recover service after a connection failure",
+    unit="ms"
+)
+
 # ============================================
 # CONFIGURACIÓN
 # ============================================
@@ -159,6 +177,7 @@ class StreamingWorker:
     def __init__(self):
         self.consumer: Optional[KafkaConsumer] = None
         self.minio_client = MinIOClient()
+        self.failure_start_time: Optional[float] = None
 
     def ensure_topic(self):
         """Asegurar que el topic exista y esté limpio para la ingesta de Bronze."""
@@ -179,6 +198,9 @@ class StreamingWorker:
         retry_count = 0
         max_retries = 5
         
+        if self.failure_start_time is None:
+            self.failure_start_time = time.time()
+
         while retry_count < max_retries:
             try:
                 self.ensure_topic()
@@ -195,6 +217,17 @@ class StreamingWorker:
                 )
                 logger.info(f"Connected to Kafka topic {KAFKA_TOPIC}")
                 statsd_client.gauge('kafka_connection_attempts', retry_count)
+
+                if self.failure_start_time is not None:
+                    recovery_ms = (time.time() - self.failure_start_time) * 1000
+                    recovery_time.record(recovery_ms, attributes={'service': 'streaming_worker'})
+                    try:
+                        statsd_client.histogram('service.recovery_time_ms', recovery_ms, tags=['service:streaming_worker'])
+                    except TypeError:
+                        statsd_client.histogram('service.recovery_time_ms', recovery_ms)
+                    self.failure_start_time = None
+                    logger.info(f"Service recovered after {recovery_ms:.2f} ms")
+
                 return True
             except Exception as e:
                 retry_count += 1
@@ -217,14 +250,19 @@ class StreamingWorker:
         try:
             while True:
                 with tracer.start_as_current_span("consume_batch"):
+                    batch_start_time = time.time()
                     messages = self.consumer.poll(timeout_ms=1000, max_records=100)
                     
                     if not messages:
                         continue
 
+                    total_in_batch = 0
+                    store_failed = 0
+
                     for topic_partition, records in messages.items():
                         with tracer.start_as_current_span("process_partition"):
                             for record in records:
+                                total_in_batch += 1
                                 start_time = time.time()
                                 
                                 try:
@@ -234,6 +272,8 @@ class StreamingWorker:
                                     if self.minio_client.store_event(event, timestamp):
                                         messages_consumed.add(1)
                                         statsd_client.increment('messages.consumed')
+                                    else:
+                                        store_failed += 1
                                     
                                     elapsed = (time.time() - start_time) * 1000
                                     processing_latency.record(elapsed)
@@ -241,6 +281,26 @@ class StreamingWorker:
                                 except Exception as e:
                                     logger.error(f"Error processing message: {str(e)}")
                                     statsd_client.increment('messages.processing_failed')
+                                    store_failed += 1
+
+                    # --- NEW: success rate % ---
+                    if total_in_batch > 0:
+                        success_pct = ((total_in_batch - store_failed) / total_in_batch) * 100
+                        pipeline_success_rate.set(success_pct)
+                        try:
+                            statsd_client.gauge('messages.success_rate_pct', success_pct)
+                        except Exception:
+                            pass
+
+                    # --- NEW: throughput events/min ---
+                    batch_elapsed_seconds = time.time() - batch_start_time
+                    if batch_elapsed_seconds > 0:
+                        throughput_val = (total_in_batch / batch_elapsed_seconds) * 60
+                        pipeline_throughput.set(throughput_val)
+                        try:
+                            statsd_client.gauge('pipeline.throughput.events_per_min', throughput_val)
+                        except Exception:
+                            pass
 
                     batch_count += 1
                     if batch_count % 10 == 0:

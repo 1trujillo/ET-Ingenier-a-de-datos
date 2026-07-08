@@ -108,6 +108,18 @@ traffic_vehicle_by_district = meter.create_counter(
     unit="1"
 )
 
+accidents_by_district = meter.create_counter(
+    name="movilidad.accidentes_por_comuna",
+    description="Accident incidents by district",
+    unit="1"
+)
+
+recovery_time = meter.create_histogram(
+    name="service.recovery_time_ms",
+    description="Time to recover service after a connection failure",
+    unit="ms"
+)
+
 # ============================================
 # CONFIGURACIÓN
 # ============================================
@@ -152,6 +164,7 @@ class EventGenerator:
     def __init__(self):
         self.producer = None
         self.sensor_ids = [f"SENSOR_{i:04d}" for i in range(1, NUM_SENSORS + 1)]
+        self.failure_start_time = None
 
     def ensure_topic(self):
         """Crear o recrear el topic de Kafka para evitar mensajes antiguos con codec incompatibles."""
@@ -172,6 +185,10 @@ class EventGenerator:
         with tracer.start_as_current_span("kafka_connection"):
             retry_count = 0
             max_retries = 5
+
+            if self.failure_start_time is None:
+                self.failure_start_time = time.time()
+
             while retry_count < max_retries:
                 try:
                     self.ensure_topic()
@@ -184,6 +201,17 @@ class EventGenerator:
                     )
                     logger.info(f"Connected to Kafka at {KAFKA_BOOTSTRAP_SERVERS}")
                     statsd_client.gauge('kafka_connection_attempts', retry_count)
+
+                    if self.failure_start_time is not None:
+                        recovery_ms = (time.time() - self.failure_start_time) * 1000
+                        recovery_time.record(recovery_ms, attributes={'service': 'generator'})
+                        try:
+                            statsd_client.histogram('service.recovery_time_ms', recovery_ms, tags=['service:generator'])
+                        except TypeError:
+                            statsd_client.histogram('service.recovery_time_ms', recovery_ms)
+                        self.failure_start_time = None
+                        logger.info(f"Service recovered after {recovery_ms:.2f} ms")
+
                     return True
                 except Exception as e:
                     retry_count += 1
@@ -281,6 +309,16 @@ class EventGenerator:
                                 events_produced.add(1)
                                 statsd_client.increment('events.produced')
                                 self._emit_traffic_metrics(event)
+
+                                # --- NEW: accidentes_por_comuna ---
+                                incident_type = event.get('incident_type', 'none')
+                                if incident_type == 'accident':
+                                    district = event.get('district', 'unknown')
+                                    accidents_by_district.add(1, attributes={'district': district})
+                                    try:
+                                        statsd_client.increment('movilidad.accidentes_por_comuna', tags=[f'district:{district}'])
+                                    except TypeError:
+                                        statsd_client.increment('movilidad.accidentes_por_comuna')
                                 
                         except Exception as e:
                             logger.error(f"Error sending event: {str(e)}")

@@ -115,15 +115,6 @@ for bucket in ['bronze', 'silver', 'gold']:
         print(bucket, 'ERROR', e)
 </file>
 
-<file path="tmp_check.py">
-import ast, pathlib
-path = pathlib.Path('etl/gold_transformer.py')
-src = path.read_text(encoding='utf-8')
-print('loaded', len(src.splitlines()), 'lines')
-ast.parse(src)
-print('AST_OK')
-</file>
-
 <file path="DELIVERY_SUMMARY.md">
 # 📋 ENTREGA - MVP DATA PLATFORM
 
@@ -783,279 +774,6 @@ Usar **Nginx** como proxy.
 5. **Testing Framework** (Pytest vs TestNG)
 6. **Logging Aggregation** (ELK vs Splunk)
 7. **Data Quality** (Great Expectations vs dbt tests)
-</file>
-
-<file path="docs/Datadog.md">
-# Datadog Setup Guide
-
-Este documento describe cómo configurar la integración con Datadog.
-
-## Paso 1: Obtener API Key
-
-1. Ir a https://app.datadoghq.com/
-2. Menu → Organization Settings → API Keys
-3. Copiar "API Key" (no "Application Key")
-
-## Paso 2: Configurar Variable de Entorno
-
-```bash
-# En .env
-export DD_API_KEY="abc123...xyz"
-
-# O en línea de comando
-DD_API_KEY="abc123...xyz" docker compose up -d
-```
-
-## Paso 3: Reiniciar Agent
-
-```bash
-docker compose restart datadog-agent
-```
-
-## Paso 4: Verificar Conexión
-
-```bash
-# Ver logs del agent
-docker compose logs datadog-agent | grep "connected"
-
-# En Datadog
-# Infrastructure → Hosts
-# Debe aparecer: data-platform
-```
-
-## Métricas Automáticas
-
-Una vez conectado, verás:
-
-### Container Metrics
-```
-docker.cpu.percentage
-docker.mem.usage
-docker.io.read_bytes
-docker.io.write_bytes
-```
-
-### System Metrics
-```
-system.cpu.user
-system.mem.used
-system.disk.used
-system.net.bytes_sent
-```
-
-## Métricas Customizadas
-
-Enviadas por cada servicio:
-
-### Generator
-```
-generator.events_produced
-generator.events_failed
-generator.production_latency_ms
-movilidad.vehiculos_por_minuto
-movilidad.vehiculos_por_avenida
-movilidad.vehiculos_por_comuna
-```
-
-### Streaming Worker
-```
-streaming_worker.messages_consumed
-streaming_worker.messages_stored
-streaming_worker.consumer_lag
-streaming_worker.processing_latency_ms
-```
-
-### ETL
-```
-etl_spark.etl_runs
-etl_spark.records_processed
-etl_spark.records_invalid
-etl_spark.etl_duration_seconds
-```
-
-### Gold
-```
-gold_transformer.transformation_runs
-gold_transformer.documents_created
-gold_transformer.transformation_duration_seconds
-```
-
-### FastAPI
-```
-fastapi.requests_total
-fastapi.request_duration_ms
-```
-
-## Crear Dashboards
-
-### Dashboard: Pipeline Health
-
-1. En Datadog → Dashboards → New Dashboard
-2. Elegir "Timeboard"
-3. Agregar widgets:
-
-```
-Widget 1: Events Produced
-Query: sum:generator.events_produced{}.as_count()
-Type: Timeseries
-
-Widget 2: Messages Consumed
-Query: sum:streaming_worker.messages_consumed{}.as_count()
-Type: Timeseries
-
-Widget 3: ETL Duration
-Query: avg:etl_spark.etl_duration_seconds{}
-Type: Timeseries
-
-Widget 4: Documents Created
-Query: sum:gold_transformer.documents_created{}.as_count()
-Type: Timeseries
-
-Widget 5: Vehículos por minuto
-Query: sum:movilidad.vehiculos_por_minuto{}.as_count()
-Type: Timeseries
-
-Widget 6: Vehículos por avenida
-Query: sum:movilidad.vehiculos_por_avenida{} by {avenue}
-Type: Top List
-
-Widget 7: Vehículos por comuna
-Query: sum:movilidad.vehiculos_por_comuna{} by {district}
-Type: Top List
-```
-
-### Dashboard: Infrastructure
-
-```
-Widget 1: CPU by Container
-Query: avg:docker.cpu.percentage{} by {container_name}
-Type: Timeseries
-
-Widget 2: Memory by Container
-Query: avg:docker.mem.usage{} by {container_name}
-Type: Timeseries
-```
-
-## Crear Monitors (Alertas)
-
-### Monitor: CPU Usage
-
-1. Monitors → New Monitor → Metric
-2. Metric: `avg:system.cpu.user{} > 0.80`
-3. Alert threshold: 0.80 for 5 minutes
-4. Notification: @slack-#data-eng
-
-### Monitor: Kafka Lag
-
-1. Monitors → New Monitor → Metric
-2. Metric: `avg:streaming_worker.consumer_lag{} > 1000`
-3. Warning threshold: 5000
-4. Alert threshold: 10000
-
-### Monitor: FastAPI Errors
-
-1. Monitors → New Monitor → Metric
-2. Metric: `sum:fastapi.request_errors{} > 0`
-
-## Troubleshooting
-
-### Agent no conecta
-
-```bash
-# Verificar logs
-docker compose logs datadog-agent | grep -i error
-
-# Verificar API key
-echo $DD_API_KEY
-
-# Reintentar
-docker compose down datadog-agent
-docker compose up -d datadog-agent
-```
-
-### Métricas no aparecen
-
-```bash
-# Verificar que servicios envían métricas
-docker compose logs generator | grep -i "statsd\|metric"
-
-# Verificar conectividad a DogStatsD
-docker compose exec generator nc -zv datadog-agent 8125
-
-# Revisar Datadog
-# Metrics → Explorer → Buscar "generator"
-```
-
-### Logs no llegan
-
-En MVP, los logs se imprimen en console. Para enviar a Datadog:
-
-```yaml
-# Próxima fase
-services:
-  generator:
-    logging:
-      driver: json-file
-      options:
-        labels: "service=generator"
-```
-
-## Costo Estimado
-
-### Datadog Pricing
-
-- Bases: ~$0.05 per container/hour
-- Logs: $1.70 per GB
-- APM: $2.25 per 1M spans
-- Custom Metrics: $5 per 100 metric
-
-### Estimación MVP
-
-Con 8 contenedores:
-- ~$3.60/día en bases
-- ~$0.50/día en APM
-- **Total: ~$120/mes**
-
-## Sin Datadog (Desarrollo)
-
-El sistema funciona completamente sin Datadog:
-
-```bash
-# Sin API key
-docker compose up -d
-
-# Ver métricas en console
-docker compose logs generator | grep "events_produced"
-```
-
-## Integración con Slack
-
-1. En Datadog → Integrations → Slack
-2. Connect Slack Workspace
-3. En Monitors, agregar notificación:
-   ```
-   @slack-#data-eng
-   ```
-
-## Próximas Fases
-
-### Fase 2: Dashboards Avanzados
-
-- Dashboard por rol (Data Eng, Analytics, DevOps)
-- Correlación entre métricas
-- Forecasting automático
-
-### Fase 3: Machine Learning
-
-- Anomaly Detection en métricas
-- Predictive Alerts
-- Root Cause Analysis
-
-## Referencias
-
-- [Datadog Agent Docs](https://docs.datadoghq.com/agent/)
-- [OpenTelemetry Exporter](https://docs.datadoghq.com/opentelemetry/)
-- [DogStatsD](https://docs.datadoghq.com/developers/dogstatsd/)
 </file>
 
 <file path="docs/Observability.md">
@@ -1745,326 +1463,6 @@ COPY . .
 CMD ["python", "generator.py"]
 </file>
 
-<file path="generator/generator.py">
-import json
-import logging
-import random
-import time
-from datetime import datetime, timedelta
-from typing import Dict, Any
-
-import numpy as np
-from kafka import KafkaProducer
-from kafka.admin import KafkaAdminClient, NewTopic
-from opentelemetry import metrics, trace
-
-try:
-    from statsd import StatsClient as _StatsClient
-except Exception:
-    try:
-        from statsd.client import StatsClient as _StatsClient
-    except Exception:
-        _StatsClient = None
-
-from otel_setup import configure_observability
-
-
-class _NoOpStatsClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def increment(self, *args, **kwargs):
-        return None
-
-    def gauge(self, *args, **kwargs):
-        return None
-
-    def histogram(self, *args, **kwargs):
-        return None
-
-
-def _build_statsd_client(prefix: str):
-    if _StatsClient is None:
-        return _NoOpStatsClient()
-
-    try:
-        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
-    except Exception:
-        return _NoOpStatsClient()
-
-# ============================================
-# LOGGING
-# ============================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format=json.dumps({
-        'timestamp': '%(asctime)s',
-        'level': '%(levelname)s',
-        'service': 'data-generator',
-        'message': '%(message)s'
-    })
-)
-logger = logging.getLogger(__name__)
-
-# ============================================
-# OBSERVABILIDAD
-# ============================================
-
-meter, tracer, _ = configure_observability("data-generator")
-
-# StatsD para métricas
-statsd_client = _build_statsd_client('generator')
-
-# ============================================
-# MÉTRICAS
-# ============================================
-
-events_produced = meter.create_counter(
-    name="events_produced",
-    description="Total events produced",
-    unit="1"
-)
-
-events_failed = meter.create_counter(
-    name="events_failed",
-    description="Total events failed",
-    unit="1"
-)
-
-production_latency = meter.create_histogram(
-    name="production_latency_ms",
-    description="Event production latency",
-    unit="ms"
-)
-
-traffic_vehicle_volume = meter.create_counter(
-    name="movilidad.vehiculos_por_minuto",
-    description="Vehicles observed per minute",
-    unit="1"
-)
-
-traffic_vehicle_by_avenue = meter.create_counter(
-    name="movilidad.vehiculos_por_avenida",
-    description="Vehicles observed by avenue",
-    unit="1"
-)
-
-traffic_vehicle_by_district = meter.create_counter(
-    name="movilidad.vehiculos_por_comuna",
-    description="Vehicles observed by district",
-    unit="1"
-)
-
-# ============================================
-# CONFIGURACIÓN
-# ============================================
-
-KAFKA_BOOTSTRAP_SERVERS = 'kafka:29092'
-KAFKA_TOPIC = 'raw_events'
-NUM_SENSORS = 100
-BATCH_SIZE = 50
-INTERVAL_SECONDS = 2
-
-SENSOR_TYPES = ['traffic', 'air_quality', 'noise', 'weather', 'incident']
-LIGHT_STATUS = ['green', 'red', 'yellow']
-INCIDENT_TYPES = ['accident', 'congestion', 'breakdown', 'road_closure', 'none']
-LOCATIONS = [
-    {"intersection": "INT_001", "avenue": "Alameda", "district": "Santiago Centro", "latitude": -33.4378, "longitude": -70.6504},
-    {"intersection": "INT_002", "avenue": "Alameda", "district": "Estación Central", "latitude": -33.4517, "longitude": -70.6765},
-    {"intersection": "INT_003", "avenue": "Av. Providencia", "district": "Providencia", "latitude": -33.4372, "longitude": -70.6303},
-    {"intersection": "INT_004", "avenue": "Av. Apoquindo", "district": "Las Condes", "latitude": -33.4218, "longitude": -70.6067},
-    {"intersection": "INT_005", "avenue": "Av. Vitacura", "district": "Vitacura", "latitude": -33.3938, "longitude": -70.5885},
-    {"intersection": "INT_006", "avenue": "Av. 10 de Julio", "district": "Lo Prado", "latitude": -33.4399, "longitude": -70.7151},
-    {"intersection": "INT_007", "avenue": "Av. Recoleta", "district": "Recoleta", "latitude": -33.4210, "longitude": -70.6508},
-    {"intersection": "INT_008", "avenue": "Av. Matta", "district": "Estación Central", "latitude": -33.4479, "longitude": -70.6753},
-    {"intersection": "INT_009", "avenue": "Av. España", "district": "Santiago Centro", "latitude": -33.4410, "longitude": -70.6542},
-    {"intersection": "INT_010", "avenue": "Av. Libertador B. O'Higgins", "district": "Santiago Centro", "latitude": -33.4480, "longitude": -70.6634},
-    {"intersection": "INT_011", "avenue": "Av. Grecia", "district": "Ñuñoa", "latitude": -33.4591, "longitude": -70.6138},
-    {"intersection": "INT_012", "avenue": "Av. Irarrázaval", "district": "Ñuñoa", "latitude": -33.4557, "longitude": -70.6121},
-    {"intersection": "INT_013", "avenue": "Av. San Diego", "district": "Santiago Centro", "latitude": -33.4447, "longitude": -70.6510},
-    {"intersection": "INT_014", "avenue": "Av. Santa Rosa", "district": "Las Condes", "latitude": -33.4130, "longitude": -70.5780},
-    {"intersection": "INT_015", "avenue": "Av. Grecia", "district": "Providencia", "latitude": -33.4310, "longitude": -70.6205},
-    {"intersection": "INT_016", "avenue": "Av. Ejército", "district": "Santiago Centro", "latitude": -33.4302, "longitude": -70.6507},
-    {"intersection": "INT_017", "avenue": "Av. Pajaritos", "district": "Lo Espejo", "latitude": -33.5275, "longitude": -70.6965},
-    {"intersection": "INT_018", "avenue": "Av. Vicuña Mackenna", "district": "Macul", "latitude": -33.4920, "longitude": -70.6196},
-    {"intersection": "INT_019", "avenue": "Av. Principal", "district": "La Cisterna", "latitude": -33.5401, "longitude": -70.6649},
-    {"intersection": "INT_020", "avenue": "Av. Circunvalación", "district": "San Miguel", "latitude": -33.4932, "longitude": -70.6498},
-]
-
-# ============================================
-# GENERADOR DE EVENTOS
-# ============================================
-
-class EventGenerator:
-    def __init__(self):
-        self.producer = None
-        self.sensor_ids = [f"SENSOR_{i:04d}" for i in range(1, NUM_SENSORS + 1)]
-
-    def ensure_topic(self):
-        """Crear o recrear el topic de Kafka para evitar mensajes antiguos con codec incompatibles."""
-        try:
-            admin_client = KafkaAdminClient(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS], client_id='generator-admin')
-            topics = admin_client.list_topics()
-            if KAFKA_TOPIC in topics:
-                admin_client.delete_topics([KAFKA_TOPIC], timeout_ms=10000)
-                time.sleep(2)
-            admin_client.create_topics([NewTopic(name=KAFKA_TOPIC, num_partitions=1, replication_factor=1)], timeout_ms=10000)
-            admin_client.close()
-            logger.info(f"Ensured Kafka topic {KAFKA_TOPIC} exists")
-        except Exception as exc:
-            logger.warning(f"Topic bootstrap skipped: {exc}")
-
-    def connect_kafka(self):
-        """Conectar a Kafka"""
-        with tracer.start_as_current_span("kafka_connection"):
-            retry_count = 0
-            max_retries = 5
-            while retry_count < max_retries:
-                try:
-                    self.ensure_topic()
-                    self.producer = KafkaProducer(
-                        bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
-                        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-                        acks='all',
-                        request_timeout_ms=30000,
-                        retries=3
-                    )
-                    logger.info(f"Connected to Kafka at {KAFKA_BOOTSTRAP_SERVERS}")
-                    statsd_client.gauge('kafka_connection_attempts', retry_count)
-                    return True
-                except Exception as e:
-                    retry_count += 1
-                    logger.warning(f"Kafka connection attempt {retry_count}/{max_retries} failed: {str(e)}")
-                    if retry_count < max_retries:
-                        time.sleep(5)
-                    else:
-                        logger.error(f"Failed to connect to Kafka after {max_retries} attempts")
-                        return False
-
-    def _emit_traffic_metrics(self, event: Dict[str, Any]):
-        """Emitir métricas de movilidad a OTel y DogStatsD."""
-        vehicle_count = int(event.get('vehicle_count', 0) or 0)
-        avenue = event.get('avenue', 'unknown')
-        district = event.get('district', 'unknown')
-
-        traffic_vehicle_volume.add(vehicle_count)
-        traffic_vehicle_by_avenue.add(vehicle_count, attributes={'avenue': avenue})
-        traffic_vehicle_by_district.add(vehicle_count, attributes={'district': district})
-
-        try:
-            statsd_client.increment('movilidad.vehiculos_por_minuto', value=vehicle_count)
-            statsd_client.increment(
-                'movilidad.vehiculos_por_avenida',
-                value=vehicle_count,
-                tags=[f'avenue:{avenue}']
-            )
-            statsd_client.increment(
-                'movilidad.vehiculos_por_comuna',
-                value=vehicle_count,
-                tags=[f'district:{district}']
-            )
-        except TypeError:
-            statsd_client.increment('movilidad.vehiculos_por_avenida', value=vehicle_count)
-            statsd_client.increment('movilidad.vehiculos_por_comuna', value=vehicle_count)
-
-    def generate_event(self, sensor_id: str) -> Dict[str, Any]:
-        """Generar un evento simulado de sensor con ubicación realista."""
-        sensor_type = random.choice(SENSOR_TYPES)
-        location = random.choice(LOCATIONS)
-
-        event = {
-            'sensor_id': sensor_id,
-            'sensor_type': sensor_type,
-            'intersection': location['intersection'],
-            'avenue': location['avenue'],
-            'district': location['district'],
-            'latitude': round(location['latitude'], 6),
-            'longitude': round(location['longitude'], 6),
-            'vehicle_count': max(0, int(np.random.poisson(25))),
-            'average_speed': round(np.random.normal(40, 15), 2),
-            'traffic_density': round(random.uniform(0, 100), 2),
-            'traffic_light_status': random.choice(LIGHT_STATUS),
-            'air_quality_index': round(random.uniform(0, 500), 2),
-            'noise_level': round(random.uniform(40, 100), 2),
-            'incident_detected': random.choice([True, False]),
-            'incident_type': random.choice(INCIDENT_TYPES) if random.random() > 0.8 else 'none',
-            'temperature': round(random.uniform(15, 35), 2),
-            'humidity': round(random.uniform(30, 90), 2),
-            'timestamp': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
-        }
-
-        return event
-
-    def produce_events(self):
-        """Producir eventos continuamente"""
-        if not self.connect_kafka():
-            logger.error("Failed to connect to Kafka")
-            return
-
-        logger.info(f"Starting to produce events from {NUM_SENSORS} sensors")
-        logger.info(f"Batch size: {BATCH_SIZE}, Interval: {INTERVAL_SECONDS}s")
-
-        try:
-            while True:
-                with tracer.start_as_current_span("batch_production"):
-                    batch = []
-                    for _ in range(BATCH_SIZE):
-                        sensor_id = random.choice(self.sensor_ids)
-                        event = self.generate_event(sensor_id)
-                        batch.append(event)
-
-                    start_time = time.time()
-                    
-                    for event in batch:
-                        try:
-                            with tracer.start_as_current_span("send_event"):
-                                future = self.producer.send(
-                                    KAFKA_TOPIC,
-                                    value=event
-                                )
-                                # Esperar confirmación (bloqueante, pero necesario para garantía)
-                                future.get(timeout=5)
-                                
-                                events_produced.add(1)
-                                statsd_client.increment('events.produced')
-                                self._emit_traffic_metrics(event)
-                                
-                        except Exception as e:
-                            logger.error(f"Error sending event: {str(e)}")
-                            events_failed.add(1)
-                            statsd_client.increment('events.failed')
-
-                    elapsed = (time.time() - start_time) * 1000
-                    production_latency.record(elapsed)
-                    statsd_client.histogram('batch.latency_ms', elapsed)
-                    statsd_client.gauge('batch.size', BATCH_SIZE)
-
-                    logger.info(
-                        f"Batch produced: {BATCH_SIZE} events in {elapsed:.2f}ms"
-                    )
-
-                    time.sleep(INTERVAL_SECONDS)
-
-        except KeyboardInterrupt:
-            logger.info("Generator stopped by user")
-        except Exception as e:
-            logger.error(f"Critical error in producer: {str(e)}")
-        finally:
-            if self.producer:
-                self.producer.flush()
-                self.producer.close()
-            logger.info("Kafka connection closed")
-
-# ============================================
-# MAIN
-# ============================================
-
-if __name__ == "__main__":
-    generator = EventGenerator()
-    generator.produce_events()
-</file>
-
 <file path="generator/requirements.txt">
 faker==24.0.0
 kafka-python==2.0.2
@@ -2107,157 +1505,6 @@ custom_logs:
     path: /var/log/containers/*.log
     service: data-platform
     source: docker
-</file>
-
-<file path="monitoring/monitors-config.yaml">
-# Datadog Monitors Configuration
-# Este archivo documenta los monitors que deben ser creados en Datadog
-
-monitors:
-  - name: "High CPU Usage"
-    type: metric_alert
-    query: "avg:system.cpu.user{service:data-platform} > 0.80"
-    threshold: 0.80
-    alert_message: "CPU usage is above 80% on {{host.name}}"
-
-  - name: "High Memory Usage"
-    type: metric_alert
-    query: "avg:system.mem.pct_usable{service:data-platform} < 0.20"
-    threshold: 20
-    alert_message: "Memory usage is above 80% on {{host.name}}"
-
-  - name: "Kafka Consumer Lag High"
-    type: metric_alert
-    query: "avg:kafka.consumer.lag{service:streaming_worker} > 1000"
-    threshold: 1000
-    alert_message: "Kafka consumer lag is high: {{value}}"
-
-  - name: "ETL Failure"
-    type: metric_alert
-    query: "avg:etl_spark.etl_runs{status:failed} > 0"
-    alert_message: "ETL pipeline failed"
-
-  - name: "FastAPI High Latency"
-    type: metric_alert
-    query: "avg:fastapi.request_duration_ms{} > 500"
-    threshold: 500
-    alert_message: "FastAPI response time is above 500ms"
-
-  - name: "Container Down"
-    type: service_check
-    query: "service_check('docker.container.up').last(4).count_by_status()"
-    alert_message: "Container is down"
-
-  - name: "MongoDB Connection Errors"
-    type: metric_alert
-    query: "sum:gold_transformer.mongodb_connection_attempts{} > 2"
-    alert_message: "Multiple MongoDB connection failures detected"
-
-dashboards:
-  - name: "Pipeline Health"
-    description: "Overall pipeline health and performance metrics"
-    widgets:
-      - title: "Generator Events Produced"
-        type: timeseries
-        query: "sum:generator.events_produced{}"
-      
-      - title: "Streaming Worker Consumption"
-        type: timeseries
-        query: "sum:streaming_worker.messages_consumed{}"
-      
-      - title: "ETL Processing Duration"
-        type: timeseries
-        query: "avg:etl_spark.etl_duration_seconds{}"
-      
-      - title: "Gold Documents Created"
-        type: timeseries
-        query: "sum:gold_transformer.documents_created{}"
-
-  - name: "Kafka Metrics"
-    description: "Kafka producer and consumer metrics"
-    widgets:
-      - title: "Events Produced Rate"
-        type: timeseries
-        query: "sum:generator.events.produced{}.as_count()"
-      
-      - title: "Consumer Lag"
-        type: timeseries
-        query: "avg:streaming_worker.consumer_lag{}"
-      
-      - title: "Batch Latency"
-        type: histogram
-        query: "avg:streaming_worker.batch.latency_ms{}"
-
-  - name: "MongoDB Metrics"
-    description: "MongoDB performance and health"
-    widgets:
-      - title: "Insert Latency"
-        type: timeseries
-        query: "avg:gold_transformer.mongodb.insert_latency_ms{}"
-      
-      - title: "Documents Stored"
-        type: timeseries
-        query: "sum:gold_transformer.documents.inserted{}"
-
-  - name: "FastAPI Metrics"
-    description: "API performance metrics"
-    widgets:
-      - title: "Request Rate"
-        type: timeseries
-        query: "sum:fastapi.requests_total{}.as_count()"
-      
-      - title: "Request Duration"
-        type: timeseries
-        query: "avg:fastapi.request_duration_ms{}"
-      
-      - title: "API Endpoints Performance"
-        type: table
-        query: "avg:fastapi.endpoint.*_duration_ms{} by {endpoint}"
-
-  - name: "Mobility Metrics"
-    description: "Urban mobility business metrics"
-    widgets:
-      - title: "Vehículos por minuto"
-        type: timeseries
-        query: "sum:movilidad.vehiculos_por_minuto{}.as_count()"
-
-      - title: "Vehículos por avenida"
-        type: toplist
-        query: "sum:movilidad.vehiculos_por_avenida{} by {avenue}"
-
-      - title: "Vehículos por comuna"
-        type: toplist
-        query: "sum:movilidad.vehiculos_por_comuna{} by {district}"
-
-  - name: "System Metrics"
-    description: "Docker and system resource metrics"
-    widgets:
-      - title: "CPU Usage by Container"
-        type: timeseries
-        query: "avg:docker.cpu.percentage{} by {container_name}"
-      
-      - title: "Memory Usage by Container"
-        type: timeseries
-        query: "avg:docker.mem.usage{} by {container_name}"
-      
-      - title: "Disk I/O"
-        type: timeseries
-        query: "avg:system.io.reads{}, avg:system.io.writes{}"
-
-  - name: "ETL Pipeline Metrics"
-    description: "ETL processing and data quality"
-    widgets:
-      - title: "Records Processed"
-        type: timeseries
-        query: "sum:etl_spark.records_processed{}"
-      
-      - title: "Invalid Records"
-        type: timeseries
-        query: "sum:etl_spark.records_invalid{}"
-      
-      - title: "Silver Data Size"
-        type: gauge
-        query: "avg:minio.bucket.size{bucket:silver}"
 </file>
 
 <file path="monitoring/nginx.conf">
@@ -3448,282 +2695,13 @@ COPY . .
 CMD ["python", "worker.py"]
 </file>
 
-<file path="streaming_worker/requirements.txt">
-kafka-python==2.0.2
-boto3==1.28.0
-python-snappy==0.7.3
-opentelemetry-api==1.31.0
-opentelemetry-sdk==1.31.0
-opentelemetry-exporter-otlp-proto-http==1.31.0
-opentelemetry-instrumentation==0.52b0
-python-statsd==2.1.0
-</file>
-
-<file path="streaming_worker/worker.py">
-import json
-import logging
-import os
-import time
-from datetime import datetime
-from typing import Optional
-
-import boto3
-from kafka import KafkaConsumer
-from kafka.admin import KafkaAdminClient, NewTopic
-from opentelemetry import metrics, trace
-
-try:
-    from statsd import StatsClient as _StatsClient
-except Exception:
-    try:
-        from statsd.client import StatsClient as _StatsClient
-    except Exception:
-        _StatsClient = None
-
-from otel_setup import configure_observability
-
-
-class _NoOpStatsClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def increment(self, *args, **kwargs):
-        return None
-
-    def gauge(self, *args, **kwargs):
-        return None
-
-    def histogram(self, *args, **kwargs):
-        return None
-
-
-def _build_statsd_client(prefix: str):
-    if _StatsClient is None:
-        return _NoOpStatsClient()
-
-    try:
-        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
-    except Exception:
-        return _NoOpStatsClient()
-
-# ============================================
-# LOGGING
-# ============================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# ============================================
-# OBSERVABILIDAD
-# ============================================
-
-meter, tracer, _ = configure_observability("streaming-worker")
-
-statsd_client = _build_statsd_client('streaming_worker')
-
-# ============================================
-# MÉTRICAS
-# ============================================
-
-messages_consumed = meter.create_counter(
-    name="messages_consumed",
-    description="Total messages consumed",
-    unit="1"
-)
-
-messages_stored = meter.create_counter(
-    name="messages_stored",
-    description="Total messages stored in bronze",
-    unit="1"
-)
-
-consumer_lag = meter.create_gauge(
-    name="consumer_lag",
-    description="Consumer lag",
-    unit="1"
-)
-
-processing_latency = meter.create_histogram(
-    name="processing_latency_ms",
-    description="Message processing latency",
-    unit="ms"
-)
-
-# ============================================
-# CONFIGURACIÓN
-# ============================================
-
-KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:29092')
-KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'raw_events')
-KAFKA_GROUP_ID = os.getenv('KAFKA_GROUP_ID', 'bronze_workers')
-
-MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', 'minio:9000')
-MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
-MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
-MINIO_BUCKET = os.getenv('MINIO_BUCKET', 'bronze')
-
-# ============================================
-# CLIENTE MINIO
-# ============================================
-
-class MinIOClient:
-    def __init__(self):
-        self.s3_client = boto3.client(
-            's3',
-            endpoint_url=f'http://{MINIO_ENDPOINT}',
-            aws_access_key_id=MINIO_ACCESS_KEY,
-            aws_secret_access_key=MINIO_SECRET_KEY,
-            region_name='us-east-1'
-        )
-        self.bucket = MINIO_BUCKET
-        self._ensure_bucket_exists()
-
-    def _ensure_bucket_exists(self):
-        """Crear bucket si no existe"""
-        try:
-            self.s3_client.head_bucket(Bucket=self.bucket)
-            logger.info(f"Bucket {self.bucket} exists")
-        except Exception:
-            logger.info(f"Creating bucket {self.bucket}")
-            self.s3_client.create_bucket(Bucket=self.bucket)
-
-    def store_event(self, event: dict, timestamp: str) -> bool:
-        """Almacenar evento en MinIO"""
-        try:
-            with tracer.start_as_current_span("minio_store"):
-                date_partition = timestamp.split('T')[0]
-                hour_partition = timestamp.split('T')[1].split(':')[0]
-                key = f"raw/date={date_partition}/hour={hour_partition}/{int(time.time() * 1000)}.json"
-                
-                self.s3_client.put_object(
-                    Bucket=self.bucket,
-                    Key=key,
-                    Body=json.dumps(event, default=str).encode('utf-8'),
-                    ContentType='application/json'
-                )
-                
-                messages_stored.add(1)
-                statsd_client.increment('messages.stored')
-                return True
-        except Exception as e:
-            logger.error(f"Error storing event in MinIO: {str(e)}")
-            statsd_client.increment('messages.store_failed')
-            return False
-
-# ============================================
-# STREAMING WORKER
-# ============================================
-
-class StreamingWorker:
-    def __init__(self):
-        self.consumer: Optional[KafkaConsumer] = None
-        self.minio_client = MinIOClient()
-
-    def ensure_topic(self):
-        """Asegurar que el topic exista y esté limpio para la ingesta de Bronze."""
-        try:
-            admin_client = KafkaAdminClient(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS], client_id='worker-admin')
-            topics = admin_client.list_topics()
-            if KAFKA_TOPIC in topics:
-                admin_client.delete_topics([KAFKA_TOPIC], timeout_ms=10000)
-                time.sleep(2)
-            admin_client.create_topics([NewTopic(name=KAFKA_TOPIC, num_partitions=1, replication_factor=1)], timeout_ms=10000)
-            admin_client.close()
-            logger.info(f"Ensured Kafka topic {KAFKA_TOPIC} exists")
-        except Exception as exc:
-            logger.warning(f"Topic bootstrap skipped: {exc}")
-
-    def connect_kafka(self):
-        """Conectar a Kafka"""
-        retry_count = 0
-        max_retries = 5
-        
-        while retry_count < max_retries:
-            try:
-                self.ensure_topic()
-                self.consumer = KafkaConsumer(
-                    KAFKA_TOPIC,
-                    bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
-                    group_id=KAFKA_GROUP_ID,
-                    value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-                    auto_offset_reset='earliest',
-                    enable_auto_commit=True,
-                    max_poll_records=100,
-                    session_timeout_ms=30000,
-                    request_timeout_ms=40000
-                )
-                logger.info(f"Connected to Kafka topic {KAFKA_TOPIC}")
-                statsd_client.gauge('kafka_connection_attempts', retry_count)
-                return True
-            except Exception as e:
-                retry_count += 1
-                logger.warning(f"Kafka connection attempt {retry_count}/{max_retries} failed: {str(e)}")
-                if retry_count < max_retries:
-                    time.sleep(5)
-                else:
-                    logger.error(f"Failed to connect to Kafka after {max_retries} attempts")
-                    return False
-
-    def process_messages(self):
-        """Procesar mensajes de Kafka"""
-        if not self.connect_kafka():
-            logger.error("Failed to connect to Kafka")
-            return
-
-        logger.info("Starting to consume messages")
-        batch_count = 0
-
-        try:
-            while True:
-                with tracer.start_as_current_span("consume_batch"):
-                    messages = self.consumer.poll(timeout_ms=1000, max_records=100)
-                    
-                    if not messages:
-                        continue
-
-                    for topic_partition, records in messages.items():
-                        with tracer.start_as_current_span("process_partition"):
-                            for record in records:
-                                start_time = time.time()
-                                
-                                try:
-                                    event = record.value
-                                    timestamp = event.get('timestamp', datetime.utcnow().isoformat())
-                                    
-                                    if self.minio_client.store_event(event, timestamp):
-                                        messages_consumed.add(1)
-                                        statsd_client.increment('messages.consumed')
-                                    
-                                    elapsed = (time.time() - start_time) * 1000
-                                    processing_latency.record(elapsed)
-                                    
-                                except Exception as e:
-                                    logger.error(f"Error processing message: {str(e)}")
-                                    statsd_client.increment('messages.processing_failed')
-
-                    batch_count += 1
-                    if batch_count % 10 == 0:
-                        logger.info(f"Processed {batch_count} batches")
-
-        except KeyboardInterrupt:
-            logger.info("Worker stopped by user")
-        except Exception as e:
-            logger.error(f"Critical error in worker: {str(e)}")
-        finally:
-            if self.consumer:
-                self.consumer.close()
-            logger.info("Kafka connection closed")
-
-# ============================================
-# MAIN
-# ============================================
-
-if __name__ == "__main__":
-    worker = StreamingWorker()
-    worker.process_messages()
+<file path="tmp_check.py">
+import ast, pathlib
+path = pathlib.Path('etl/gold_transformer.py')
+src = path.read_text(encoding='utf-8')
+print('loaded', len(src.splitlines()), 'lines')
+ast.parse(src)
+print('AST_OK')
 </file>
 
 <file path="VERIFICATION.md">
@@ -4941,6 +3919,279 @@ Consumidores (Datadog, Dashboards, etc)
 - Bucket policies en MinIO
 </file>
 
+<file path="docs/Datadog.md">
+# Datadog Setup Guide
+
+Este documento describe cómo configurar la integración con Datadog.
+
+## Paso 1: Obtener API Key
+
+1. Ir a https://app.datadoghq.com/
+2. Menu → Organization Settings → API Keys
+3. Copiar "API Key" (no "Application Key")
+
+## Paso 2: Configurar Variable de Entorno
+
+```bash
+# En .env
+export DD_API_KEY="abc123...xyz"
+
+# O en línea de comando
+DD_API_KEY="abc123...xyz" docker compose up -d
+```
+
+## Paso 3: Reiniciar Agent
+
+```bash
+docker compose restart datadog-agent
+```
+
+## Paso 4: Verificar Conexión
+
+```bash
+# Ver logs del agent
+docker compose logs datadog-agent | grep "connected"
+
+# En Datadog
+# Infrastructure → Hosts
+# Debe aparecer: data-platform
+```
+
+## Métricas Automáticas
+
+Una vez conectado, verás:
+
+### Container Metrics
+```
+docker.cpu.percentage
+docker.mem.usage
+docker.io.read_bytes
+docker.io.write_bytes
+```
+
+### System Metrics
+```
+system.cpu.user
+system.mem.used
+system.disk.used
+system.net.bytes_sent
+```
+
+## Métricas Customizadas
+
+Enviadas por cada servicio:
+
+### Generator
+```
+generator.events_produced
+generator.events_failed
+generator.production_latency_ms
+movilidad.vehiculos_por_minuto
+movilidad.vehiculos_por_avenida
+movilidad.vehiculos_por_comuna
+```
+
+### Streaming Worker
+```
+streaming_worker.messages_consumed
+streaming_worker.messages_stored
+streaming_worker.consumer_lag
+streaming_worker.processing_latency_ms
+```
+
+### ETL
+```
+etl_spark.etl_runs
+etl_spark.records_processed
+etl_spark.records_invalid
+etl_spark.etl_duration_seconds
+```
+
+### Gold
+```
+gold_transformer.transformation_runs
+gold_transformer.documents_created
+gold_transformer.transformation_duration_seconds
+```
+
+### FastAPI
+```
+fastapi.requests_total
+fastapi.request_duration_ms
+```
+
+## Crear Dashboards
+
+### Dashboard: Pipeline Health
+
+1. En Datadog → Dashboards → New Dashboard
+2. Elegir "Timeboard"
+3. Agregar widgets:
+
+```
+Widget 1: Events Produced
+Query: sum:generator.events_produced{}.as_count()
+Type: Timeseries
+
+Widget 2: Messages Consumed
+Query: sum:streaming_worker.messages_consumed{}.as_count()
+Type: Timeseries
+
+Widget 3: ETL Duration
+Query: avg:etl_spark.etl_duration_seconds{}
+Type: Timeseries
+
+Widget 4: Documents Created
+Query: sum:gold_transformer.documents_created{}.as_count()
+Type: Timeseries
+
+Widget 5: Vehículos por minuto
+Query: sum:movilidad.vehiculos_por_minuto{}.as_count()
+Type: Timeseries
+
+Widget 6: Vehículos por avenida
+Query: sum:movilidad.vehiculos_por_avenida{} by {avenue}
+Type: Top List
+
+Widget 7: Vehículos por comuna
+Query: sum:movilidad.vehiculos_por_comuna{} by {district}
+Type: Top List
+```
+
+### Dashboard: Infrastructure
+
+```
+Widget 1: CPU by Container
+Query: avg:docker.cpu.percentage{} by {container_name}
+Type: Timeseries
+
+Widget 2: Memory by Container
+Query: avg:docker.mem.usage{} by {container_name}
+Type: Timeseries
+```
+
+## Crear Monitors (Alertas)
+
+### Monitor: CPU Usage
+
+1. Monitors → New Monitor → Metric
+2. Metric: `avg:system.cpu.user{} > 0.80`
+3. Alert threshold: 0.80 for 5 minutes
+4. Notification: @slack-#data-eng
+
+### Monitor: Kafka Lag
+
+1. Monitors → New Monitor → Metric
+2. Metric: `avg:streaming_worker.consumer_lag{} > 1000`
+3. Warning threshold: 5000
+4. Alert threshold: 10000
+
+### Monitor: FastAPI Errors
+
+1. Monitors → New Monitor → Metric
+2. Metric: `sum:fastapi.request_errors{} > 0`
+
+## Troubleshooting
+
+### Agent no conecta
+
+```bash
+# Verificar logs
+docker compose logs datadog-agent | grep -i error
+
+# Verificar API key
+echo $DD_API_KEY
+
+# Reintentar
+docker compose down datadog-agent
+docker compose up -d datadog-agent
+```
+
+### Métricas no aparecen
+
+```bash
+# Verificar que servicios envían métricas
+docker compose logs generator | grep -i "statsd\|metric"
+
+# Verificar conectividad a DogStatsD
+docker compose exec generator nc -zv datadog-agent 8125
+
+# Revisar Datadog
+# Metrics → Explorer → Buscar "generator"
+```
+
+### Logs no llegan
+
+En MVP, los logs se imprimen en console. Para enviar a Datadog:
+
+```yaml
+# Próxima fase
+services:
+  generator:
+    logging:
+      driver: json-file
+      options:
+        labels: "service=generator"
+```
+
+## Costo Estimado
+
+### Datadog Pricing
+
+- Bases: ~$0.05 per container/hour
+- Logs: $1.70 per GB
+- APM: $2.25 per 1M spans
+- Custom Metrics: $5 per 100 metric
+
+### Estimación MVP
+
+Con 8 contenedores:
+- ~$3.60/día en bases
+- ~$0.50/día en APM
+- **Total: ~$120/mes**
+
+## Sin Datadog (Desarrollo)
+
+El sistema funciona completamente sin Datadog:
+
+```bash
+# Sin API key
+docker compose up -d
+
+# Ver métricas en console
+docker compose logs generator | grep "events_produced"
+```
+
+## Integración con Slack
+
+1. En Datadog → Integrations → Slack
+2. Connect Slack Workspace
+3. En Monitors, agregar notificación:
+   ```
+   @slack-#data-eng
+   ```
+
+## Próximas Fases
+
+### Fase 2: Dashboards Avanzados
+
+- Dashboard por rol (Data Eng, Analytics, DevOps)
+- Correlación entre métricas
+- Forecasting automático
+
+### Fase 3: Machine Learning
+
+- Anomaly Detection en métricas
+- Predictive Alerts
+- Root Cause Analysis
+
+## Referencias
+
+- [Datadog Agent Docs](https://docs.datadoghq.com/agent/)
+- [OpenTelemetry Exporter](https://docs.datadoghq.com/opentelemetry/)
+- [DogStatsD](https://docs.datadoghq.com/developers/dogstatsd/)
+</file>
+
 <file path="docs/Medallion.md">
 # Arquitectura Medallion
 
@@ -5683,6 +4934,1472 @@ enable_auto_commit=True
 [Gold] Inserted 250 hourly metrics
 [API] GET /metrics/hourly - 200 OK - 85ms
 ```
+</file>
+
+<file path="etl/otel_setup.py">
+import logging
+import os
+from typing import Optional, Tuple
+
+from opentelemetry import metrics, trace
+from opentelemetry._logs import set_logger_provider
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+
+def _build_otlp_exporter(exporter_cls, endpoint: str, timeout: int = 10):
+    try:
+        return exporter_cls(endpoint=endpoint, insecure=True, timeout=timeout)
+    except TypeError:
+        return exporter_cls(endpoint=endpoint, timeout=timeout)
+
+
+def configure_observability(
+    service_name: str,
+    log_level: int = logging.INFO,
+    service_version: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> Tuple[object, object, object]:
+    """Configure OpenTelemetry exporters for traces, metrics, and logs."""
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://datadog-agent:4318")
+    endpoint = endpoint.rstrip("/")
+
+    # Control whether to send logs via OTLP. Many local Datadog agent
+    # installations don't expose an OTLP logs HTTP endpoint, so keep
+    # this disabled by default and rely on the Datadog agent's
+    # container log collection instead.
+    send_logs = os.getenv("OTEL_EXPORTER_OTLP_SEND_LOGS", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+    resource = Resource.create(
+        {
+            "service.name": service_name,
+            "service.version": service_version or os.getenv("SERVICE_VERSION", "dev"),
+            "deployment.environment": environment or os.getenv("OTEL_ENVIRONMENT", "local"),
+        }
+    )
+
+    metric_reader = PeriodicExportingMetricReader(
+        _build_otlp_exporter(OTLPMetricExporter, f"{endpoint}/v1/metrics"),
+        export_interval_millis=10000,
+    )
+    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
+
+    tracer_provider = TracerProvider(resource=resource)
+    tracer_provider.add_span_processor(
+        BatchSpanProcessor(
+            _build_otlp_exporter(OTLPSpanExporter, f"{endpoint}/v1/traces")
+        )
+    )
+    trace.set_tracer_provider(tracer_provider)
+
+    logger_provider = None
+    if send_logs:
+        logger_provider = LoggerProvider(resource=resource)
+        logger_provider.add_log_record_processor(
+            BatchLogRecordProcessor(
+                _build_otlp_exporter(OTLPLogExporter, f"{endpoint}/v1/logs")
+            )
+        )
+        set_logger_provider(logger_provider)
+
+        root_logger = logging.getLogger()
+        root_logger.setLevel(log_level)
+        root_logger.addHandler(LoggingHandler(level=log_level, logger_provider=logger_provider))
+
+    meter = metrics.get_meter(service_name)
+    tracer = trace.get_tracer(service_name)
+    return meter, tracer, logger_provider
+</file>
+
+<file path="fastapi_service/otel_setup.py">
+import logging
+import os
+from typing import Optional, Tuple
+
+from opentelemetry import metrics, trace
+from opentelemetry._logs import set_logger_provider
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+
+def _build_otlp_exporter(exporter_cls, endpoint: str, timeout: int = 10):
+    try:
+        return exporter_cls(endpoint=endpoint, insecure=True, timeout=timeout)
+    except TypeError:
+        return exporter_cls(endpoint=endpoint, timeout=timeout)
+
+
+def configure_observability(
+    service_name: str,
+    log_level: int = logging.INFO,
+    service_version: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> Tuple[object, object, object]:
+    """Configure OpenTelemetry exporters for traces, metrics, and logs."""
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://datadog-agent:4318")
+    endpoint = endpoint.rstrip("/")
+
+    # Control whether to send logs via OTLP. Many local Datadog agent
+    # installations don't expose an OTLP logs HTTP endpoint, so keep
+    # this disabled by default and rely on the Datadog agent's
+    # container log collection instead.
+    send_logs = os.getenv("OTEL_EXPORTER_OTLP_SEND_LOGS", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+    resource = Resource.create(
+        {
+            "service.name": service_name,
+            "service.version": service_version or os.getenv("SERVICE_VERSION", "dev"),
+            "deployment.environment": environment or os.getenv("OTEL_ENVIRONMENT", "local"),
+        }
+    )
+
+    metric_reader = PeriodicExportingMetricReader(
+        _build_otlp_exporter(OTLPMetricExporter, f"{endpoint}/v1/metrics"),
+        export_interval_millis=10000,
+    )
+    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
+
+    tracer_provider = TracerProvider(resource=resource)
+    tracer_provider.add_span_processor(
+        BatchSpanProcessor(
+            _build_otlp_exporter(OTLPSpanExporter, f"{endpoint}/v1/traces")
+        )
+    )
+    trace.set_tracer_provider(tracer_provider)
+
+    logger_provider = None
+    if send_logs:
+        logger_provider = LoggerProvider(resource=resource)
+        logger_provider.add_log_record_processor(
+            BatchLogRecordProcessor(
+                _build_otlp_exporter(OTLPLogExporter, f"{endpoint}/v1/logs")
+            )
+        )
+        set_logger_provider(logger_provider)
+
+        root_logger = logging.getLogger()
+        root_logger.setLevel(log_level)
+        root_logger.addHandler(LoggingHandler(level=log_level, logger_provider=logger_provider))
+
+    meter = metrics.get_meter(service_name)
+    tracer = trace.get_tracer(service_name)
+    return meter, tracer, logger_provider
+</file>
+
+<file path="fastapi_service/requirements.txt">
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+boto3==1.28.0
+pydantic==2.9.2
+opentelemetry-api==1.31.0
+opentelemetry-sdk==1.31.0
+opentelemetry-exporter-otlp-proto-http==1.31.0
+opentelemetry-instrumentation-fastapi==0.52b0
+opentelemetry-instrumentation-requests==0.52b0
+opentelemetry-instrumentation==0.52b0
+python-statsd==2.1.0
+</file>
+
+<file path="generator/generator.py">
+import json
+import logging
+import random
+import time
+from datetime import datetime, timedelta
+from typing import Dict, Any
+
+import numpy as np
+from kafka import KafkaProducer
+from kafka.admin import KafkaAdminClient, NewTopic
+from opentelemetry import metrics, trace
+
+try:
+    from statsd import StatsClient as _StatsClient
+except Exception:
+    try:
+        from statsd.client import StatsClient as _StatsClient
+    except Exception:
+        _StatsClient = None
+
+from otel_setup import configure_observability
+
+
+class _NoOpStatsClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def increment(self, *args, **kwargs):
+        return None
+
+    def gauge(self, *args, **kwargs):
+        return None
+
+    def histogram(self, *args, **kwargs):
+        return None
+
+
+def _build_statsd_client(prefix: str):
+    if _StatsClient is None:
+        return _NoOpStatsClient()
+
+    try:
+        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
+    except Exception:
+        return _NoOpStatsClient()
+
+# ============================================
+# LOGGING
+# ============================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=json.dumps({
+        'timestamp': '%(asctime)s',
+        'level': '%(levelname)s',
+        'service': 'data-generator',
+        'message': '%(message)s'
+    })
+)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# OBSERVABILIDAD
+# ============================================
+
+meter, tracer, _ = configure_observability("data-generator")
+
+# StatsD para métricas
+statsd_client = _build_statsd_client('generator')
+
+# ============================================
+# MÉTRICAS
+# ============================================
+
+events_produced = meter.create_counter(
+    name="events_produced",
+    description="Total events produced",
+    unit="1"
+)
+
+events_failed = meter.create_counter(
+    name="events_failed",
+    description="Total events failed",
+    unit="1"
+)
+
+production_latency = meter.create_histogram(
+    name="production_latency_ms",
+    description="Event production latency",
+    unit="ms"
+)
+
+traffic_vehicle_volume = meter.create_counter(
+    name="movilidad.vehiculos_por_minuto",
+    description="Vehicles observed per minute",
+    unit="1"
+)
+
+traffic_vehicle_by_avenue = meter.create_counter(
+    name="movilidad.vehiculos_por_avenida",
+    description="Vehicles observed by avenue",
+    unit="1"
+)
+
+traffic_vehicle_by_district = meter.create_counter(
+    name="movilidad.vehiculos_por_comuna",
+    description="Vehicles observed by district",
+    unit="1"
+)
+
+# ============================================
+# CONFIGURACIÓN
+# ============================================
+
+KAFKA_BOOTSTRAP_SERVERS = 'kafka:29092'
+KAFKA_TOPIC = 'raw_events'
+NUM_SENSORS = 100
+BATCH_SIZE = 50
+INTERVAL_SECONDS = 2
+
+SENSOR_TYPES = ['traffic', 'air_quality', 'noise', 'weather', 'incident']
+LIGHT_STATUS = ['green', 'red', 'yellow']
+INCIDENT_TYPES = ['accident', 'congestion', 'breakdown', 'road_closure', 'none']
+LOCATIONS = [
+    {"intersection": "INT_001", "avenue": "Alameda", "district": "Santiago Centro", "latitude": -33.4378, "longitude": -70.6504},
+    {"intersection": "INT_002", "avenue": "Alameda", "district": "Estación Central", "latitude": -33.4517, "longitude": -70.6765},
+    {"intersection": "INT_003", "avenue": "Av. Providencia", "district": "Providencia", "latitude": -33.4372, "longitude": -70.6303},
+    {"intersection": "INT_004", "avenue": "Av. Apoquindo", "district": "Las Condes", "latitude": -33.4218, "longitude": -70.6067},
+    {"intersection": "INT_005", "avenue": "Av. Vitacura", "district": "Vitacura", "latitude": -33.3938, "longitude": -70.5885},
+    {"intersection": "INT_006", "avenue": "Av. 10 de Julio", "district": "Lo Prado", "latitude": -33.4399, "longitude": -70.7151},
+    {"intersection": "INT_007", "avenue": "Av. Recoleta", "district": "Recoleta", "latitude": -33.4210, "longitude": -70.6508},
+    {"intersection": "INT_008", "avenue": "Av. Matta", "district": "Estación Central", "latitude": -33.4479, "longitude": -70.6753},
+    {"intersection": "INT_009", "avenue": "Av. España", "district": "Santiago Centro", "latitude": -33.4410, "longitude": -70.6542},
+    {"intersection": "INT_010", "avenue": "Av. Libertador B. O'Higgins", "district": "Santiago Centro", "latitude": -33.4480, "longitude": -70.6634},
+    {"intersection": "INT_011", "avenue": "Av. Grecia", "district": "Ñuñoa", "latitude": -33.4591, "longitude": -70.6138},
+    {"intersection": "INT_012", "avenue": "Av. Irarrázaval", "district": "Ñuñoa", "latitude": -33.4557, "longitude": -70.6121},
+    {"intersection": "INT_013", "avenue": "Av. San Diego", "district": "Santiago Centro", "latitude": -33.4447, "longitude": -70.6510},
+    {"intersection": "INT_014", "avenue": "Av. Santa Rosa", "district": "Las Condes", "latitude": -33.4130, "longitude": -70.5780},
+    {"intersection": "INT_015", "avenue": "Av. Grecia", "district": "Providencia", "latitude": -33.4310, "longitude": -70.6205},
+    {"intersection": "INT_016", "avenue": "Av. Ejército", "district": "Santiago Centro", "latitude": -33.4302, "longitude": -70.6507},
+    {"intersection": "INT_017", "avenue": "Av. Pajaritos", "district": "Lo Espejo", "latitude": -33.5275, "longitude": -70.6965},
+    {"intersection": "INT_018", "avenue": "Av. Vicuña Mackenna", "district": "Macul", "latitude": -33.4920, "longitude": -70.6196},
+    {"intersection": "INT_019", "avenue": "Av. Principal", "district": "La Cisterna", "latitude": -33.5401, "longitude": -70.6649},
+    {"intersection": "INT_020", "avenue": "Av. Circunvalación", "district": "San Miguel", "latitude": -33.4932, "longitude": -70.6498},
+]
+
+# ============================================
+# GENERADOR DE EVENTOS
+# ============================================
+
+class EventGenerator:
+    def __init__(self):
+        self.producer = None
+        self.sensor_ids = [f"SENSOR_{i:04d}" for i in range(1, NUM_SENSORS + 1)]
+
+    def ensure_topic(self):
+        """Crear o recrear el topic de Kafka para evitar mensajes antiguos con codec incompatibles."""
+        try:
+            admin_client = KafkaAdminClient(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS], client_id='generator-admin')
+            topics = admin_client.list_topics()
+            if KAFKA_TOPIC in topics:
+                admin_client.delete_topics([KAFKA_TOPIC], timeout_ms=10000)
+                time.sleep(2)
+            admin_client.create_topics([NewTopic(name=KAFKA_TOPIC, num_partitions=1, replication_factor=1)], timeout_ms=10000)
+            admin_client.close()
+            logger.info(f"Ensured Kafka topic {KAFKA_TOPIC} exists")
+        except Exception as exc:
+            logger.warning(f"Topic bootstrap skipped: {exc}")
+
+    def connect_kafka(self):
+        """Conectar a Kafka"""
+        with tracer.start_as_current_span("kafka_connection"):
+            retry_count = 0
+            max_retries = 5
+            while retry_count < max_retries:
+                try:
+                    self.ensure_topic()
+                    self.producer = KafkaProducer(
+                        bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
+                        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                        acks='all',
+                        request_timeout_ms=30000,
+                        retries=3
+                    )
+                    logger.info(f"Connected to Kafka at {KAFKA_BOOTSTRAP_SERVERS}")
+                    statsd_client.gauge('kafka_connection_attempts', retry_count)
+                    return True
+                except Exception as e:
+                    retry_count += 1
+                    logger.warning(f"Kafka connection attempt {retry_count}/{max_retries} failed: {str(e)}")
+                    if retry_count < max_retries:
+                        time.sleep(5)
+                    else:
+                        logger.error(f"Failed to connect to Kafka after {max_retries} attempts")
+                        return False
+
+    def _emit_traffic_metrics(self, event: Dict[str, Any]):
+        """Emitir métricas de movilidad a OTel y DogStatsD."""
+        vehicle_count = int(event.get('vehicle_count', 0) or 0)
+        avenue = event.get('avenue', 'unknown')
+        district = event.get('district', 'unknown')
+
+        traffic_vehicle_volume.add(vehicle_count)
+        traffic_vehicle_by_avenue.add(vehicle_count, attributes={'avenue': avenue})
+        traffic_vehicle_by_district.add(vehicle_count, attributes={'district': district})
+
+        try:
+            statsd_client.increment('movilidad.vehiculos_por_minuto', value=vehicle_count)
+            statsd_client.increment(
+                'movilidad.vehiculos_por_avenida',
+                value=vehicle_count,
+                tags=[f'avenue:{avenue}']
+            )
+            statsd_client.increment(
+                'movilidad.vehiculos_por_comuna',
+                value=vehicle_count,
+                tags=[f'district:{district}']
+            )
+        except TypeError:
+            statsd_client.increment('movilidad.vehiculos_por_avenida', value=vehicle_count)
+            statsd_client.increment('movilidad.vehiculos_por_comuna', value=vehicle_count)
+
+    def generate_event(self, sensor_id: str) -> Dict[str, Any]:
+        """Generar un evento simulado de sensor con ubicación realista."""
+        sensor_type = random.choice(SENSOR_TYPES)
+        location = random.choice(LOCATIONS)
+
+        event = {
+            'sensor_id': sensor_id,
+            'sensor_type': sensor_type,
+            'intersection': location['intersection'],
+            'avenue': location['avenue'],
+            'district': location['district'],
+            'latitude': round(location['latitude'], 6),
+            'longitude': round(location['longitude'], 6),
+            'vehicle_count': max(0, int(np.random.poisson(25))),
+            'average_speed': round(np.random.normal(40, 15), 2),
+            'traffic_density': round(random.uniform(0, 100), 2),
+            'traffic_light_status': random.choice(LIGHT_STATUS),
+            'air_quality_index': round(random.uniform(0, 500), 2),
+            'noise_level': round(random.uniform(40, 100), 2),
+            'incident_detected': random.choice([True, False]),
+            'incident_type': random.choice(INCIDENT_TYPES) if random.random() > 0.8 else 'none',
+            'temperature': round(random.uniform(15, 35), 2),
+            'humidity': round(random.uniform(30, 90), 2),
+            'timestamp': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        }
+
+        return event
+
+    def produce_events(self):
+        """Producir eventos continuamente"""
+        if not self.connect_kafka():
+            logger.error("Failed to connect to Kafka")
+            return
+
+        logger.info(f"Starting to produce events from {NUM_SENSORS} sensors")
+        logger.info(f"Batch size: {BATCH_SIZE}, Interval: {INTERVAL_SECONDS}s")
+
+        try:
+            while True:
+                with tracer.start_as_current_span("batch_production"):
+                    batch = []
+                    for _ in range(BATCH_SIZE):
+                        sensor_id = random.choice(self.sensor_ids)
+                        event = self.generate_event(sensor_id)
+                        batch.append(event)
+
+                    start_time = time.time()
+                    
+                    for event in batch:
+                        try:
+                            with tracer.start_as_current_span("send_event"):
+                                future = self.producer.send(
+                                    KAFKA_TOPIC,
+                                    value=event
+                                )
+                                # Esperar confirmación (bloqueante, pero necesario para garantía)
+                                future.get(timeout=5)
+                                
+                                events_produced.add(1)
+                                statsd_client.increment('events.produced')
+                                self._emit_traffic_metrics(event)
+                                
+                        except Exception as e:
+                            logger.error(f"Error sending event: {str(e)}")
+                            events_failed.add(1)
+                            statsd_client.increment('events.failed')
+
+                    elapsed = (time.time() - start_time) * 1000
+                    production_latency.record(elapsed)
+                    statsd_client.histogram('batch.latency_ms', elapsed)
+                    statsd_client.gauge('batch.size', BATCH_SIZE)
+
+                    logger.info(
+                        f"Batch produced: {BATCH_SIZE} events in {elapsed:.2f}ms"
+                    )
+
+                    time.sleep(INTERVAL_SECONDS)
+
+        except KeyboardInterrupt:
+            logger.info("Generator stopped by user")
+        except Exception as e:
+            logger.error(f"Critical error in producer: {str(e)}")
+        finally:
+            if self.producer:
+                self.producer.flush()
+                self.producer.close()
+            logger.info("Kafka connection closed")
+
+# ============================================
+# MAIN
+# ============================================
+
+if __name__ == "__main__":
+    generator = EventGenerator()
+    generator.produce_events()
+</file>
+
+<file path="generator/otel_setup.py">
+import logging
+import os
+from typing import Optional, Tuple
+
+from opentelemetry import metrics, trace
+from opentelemetry._logs import set_logger_provider
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+
+def _build_otlp_exporter(exporter_cls, endpoint: str, timeout: int = 10):
+    try:
+        return exporter_cls(endpoint=endpoint, insecure=True, timeout=timeout)
+    except TypeError:
+        return exporter_cls(endpoint=endpoint, timeout=timeout)
+
+
+def configure_observability(
+    service_name: str,
+    log_level: int = logging.INFO,
+    service_version: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> Tuple[object, object, object]:
+    """Configure OpenTelemetry exporters for traces, metrics, and logs."""
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://datadog-agent:4318")
+    endpoint = endpoint.rstrip("/")
+
+    # Control whether to send logs via OTLP. Many local Datadog agent
+    # installations don't expose an OTLP logs HTTP endpoint, so keep
+    # this disabled by default and rely on the Datadog agent's
+    # container log collection instead.
+    send_logs = os.getenv("OTEL_EXPORTER_OTLP_SEND_LOGS", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+    resource = Resource.create(
+        {
+            "service.name": service_name,
+            "service.version": service_version or os.getenv("SERVICE_VERSION", "dev"),
+            "deployment.environment": environment or os.getenv("OTEL_ENVIRONMENT", "local"),
+        }
+    )
+
+    metric_reader = PeriodicExportingMetricReader(
+        _build_otlp_exporter(OTLPMetricExporter, f"{endpoint}/v1/metrics"),
+        export_interval_millis=10000,
+    )
+    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
+
+    tracer_provider = TracerProvider(resource=resource)
+    tracer_provider.add_span_processor(
+        BatchSpanProcessor(
+            _build_otlp_exporter(OTLPSpanExporter, f"{endpoint}/v1/traces")
+        )
+    )
+    trace.set_tracer_provider(tracer_provider)
+
+    logger_provider = None
+    if send_logs:
+        logger_provider = LoggerProvider(resource=resource)
+        logger_provider.add_log_record_processor(
+            BatchLogRecordProcessor(
+                _build_otlp_exporter(OTLPLogExporter, f"{endpoint}/v1/logs")
+            )
+        )
+        set_logger_provider(logger_provider)
+
+        root_logger = logging.getLogger()
+        root_logger.setLevel(log_level)
+        root_logger.addHandler(LoggingHandler(level=log_level, logger_provider=logger_provider))
+
+    meter = metrics.get_meter(service_name)
+    tracer = trace.get_tracer(service_name)
+    return meter, tracer, logger_provider
+</file>
+
+<file path="monitoring/monitors-config.yaml">
+# Datadog Monitors Configuration
+# Este archivo documenta los monitors que deben ser creados en Datadog
+
+monitors:
+  - name: "High CPU Usage"
+    type: metric_alert
+    query: "avg:system.cpu.user{service:data-platform} > 0.80"
+    threshold: 0.80
+    alert_message: "CPU usage is above 80% on {{host.name}}"
+
+  - name: "High Memory Usage"
+    type: metric_alert
+    query: "avg:system.mem.pct_usable{service:data-platform} < 0.20"
+    threshold: 20
+    alert_message: "Memory usage is above 80% on {{host.name}}"
+
+  - name: "Kafka Consumer Lag High"
+    type: metric_alert
+    query: "avg:kafka.consumer.lag{service:streaming_worker} > 1000"
+    threshold: 1000
+    alert_message: "Kafka consumer lag is high: {{value}}"
+
+  - name: "ETL Failure"
+    type: metric_alert
+    query: "avg:etl_spark.etl_runs{status:failed} > 0"
+    alert_message: "ETL pipeline failed"
+
+  - name: "FastAPI High Latency"
+    type: metric_alert
+    query: "avg:fastapi.request_duration_ms{} > 500"
+    threshold: 500
+    alert_message: "FastAPI response time is above 500ms"
+
+  - name: "Container Down"
+    type: service_check
+    query: "service_check('docker.container.up').last(4).count_by_status()"
+    alert_message: "Container is down"
+
+  - name: "MongoDB Connection Errors"
+    type: metric_alert
+    query: "sum:gold_transformer.mongodb_connection_attempts{} > 2"
+    alert_message: "Multiple MongoDB connection failures detected"
+
+dashboards:
+  - name: "Pipeline Health"
+    description: "Overall pipeline health and performance metrics"
+    widgets:
+      - title: "Generator Events Produced"
+        type: timeseries
+        query: "sum:generator.events_produced{}"
+      
+      - title: "Streaming Worker Consumption"
+        type: timeseries
+        query: "sum:streaming_worker.messages_consumed{}"
+      
+      - title: "ETL Processing Duration"
+        type: timeseries
+        query: "avg:etl_spark.etl_duration_seconds{}"
+      
+      - title: "Gold Documents Created"
+        type: timeseries
+        query: "sum:gold_transformer.documents_created{}"
+
+  - name: "Kafka Metrics"
+    description: "Kafka producer and consumer metrics"
+    widgets:
+      - title: "Events Produced Rate"
+        type: timeseries
+        query: "sum:generator.events.produced{}.as_count()"
+      
+      - title: "Consumer Lag"
+        type: timeseries
+        query: "avg:streaming_worker.consumer_lag{}"
+      
+      - title: "Batch Latency"
+        type: histogram
+        query: "avg:streaming_worker.batch.latency_ms{}"
+
+  - name: "MongoDB Metrics"
+    description: "MongoDB performance and health"
+    widgets:
+      - title: "Insert Latency"
+        type: timeseries
+        query: "avg:gold_transformer.mongodb.insert_latency_ms{}"
+      
+      - title: "Documents Stored"
+        type: timeseries
+        query: "sum:gold_transformer.documents.inserted{}"
+
+  - name: "FastAPI Metrics"
+    description: "API performance metrics"
+    widgets:
+      - title: "Request Rate"
+        type: timeseries
+        query: "sum:fastapi.requests_total{}.as_count()"
+      
+      - title: "Request Duration"
+        type: timeseries
+        query: "avg:fastapi.request_duration_ms{}"
+      
+      - title: "API Endpoints Performance"
+        type: table
+        query: "avg:fastapi.endpoint.*_duration_ms{} by {endpoint}"
+
+  - name: "Mobility Metrics"
+    description: "Urban mobility business metrics"
+    widgets:
+      - title: "Vehículos por minuto"
+        type: timeseries
+        query: "sum:movilidad.vehiculos_por_minuto{}.as_count()"
+
+      - title: "Vehículos por avenida"
+        type: toplist
+        query: "sum:movilidad.vehiculos_por_avenida{} by {avenue}"
+
+      - title: "Vehículos por comuna"
+        type: toplist
+        query: "sum:movilidad.vehiculos_por_comuna{} by {district}"
+
+  - name: "System Metrics"
+    description: "Docker and system resource metrics"
+    widgets:
+      - title: "CPU Usage by Container"
+        type: timeseries
+        query: "avg:docker.cpu.percentage{} by {container_name}"
+      
+      - title: "Memory Usage by Container"
+        type: timeseries
+        query: "avg:docker.mem.usage{} by {container_name}"
+      
+      - title: "Disk I/O"
+        type: timeseries
+        query: "avg:system.io.reads{}, avg:system.io.writes{}"
+
+  - name: "ETL Pipeline Metrics"
+    description: "ETL processing and data quality"
+    widgets:
+      - title: "Records Processed"
+        type: timeseries
+        query: "sum:etl_spark.records_processed{}"
+      
+      - title: "Invalid Records"
+        type: timeseries
+        query: "sum:etl_spark.records_invalid{}"
+      
+      - title: "Silver Data Size"
+        type: gauge
+        query: "avg:minio.bucket.size{bucket:silver}"
+</file>
+
+<file path="QUICKSTART.sh">
+#!/bin/bash
+
+# ============================================
+# QUICK START - Data Platform MVP
+# ============================================
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║   Data Platform MVP - Data Engineering Architecture       ║"
+echo "║   Medallion Architecture with Full Observability          ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+# Verificar Docker
+echo "📦 Verificando requisitos..."
+if ! command -v docker &> /dev/null; then
+    echo "❌ Docker no está instalado. Por favor instalar Docker Desktop."
+    exit 1
+fi
+
+if ! command -v docker compose &> /dev/null; then
+    echo "❌ Docker Compose no está instalado."
+    exit 1
+fi
+
+echo "✅ Docker instalado"
+echo ""
+
+# Mostrar servicios
+echo "🚀 Iniciando servicios..."
+echo ""
+echo "Servicios que se levantarán:"
+echo "  ✓ Zookeeper (2181)"
+echo "  ✓ Kafka (9092)"
+echo "  ✓ MinIO S3 (9000, 9001)"
+echo "  ✓ Datadog Agent (8126)"
+echo "  ✓ Data Generator"
+echo "  ✓ Streaming Worker (Bronze)"
+echo "  ✓ ETL Spark (Silver)"
+echo "  ✓ Gold Transformer (Gold)"
+echo "  ✓ FastAPI (8000)"
+echo "  ✓ Nginx Proxy (80, 443)"
+echo ""
+
+# Levantar servicios
+docker compose up -d
+
+echo "⏳ Esperando servicios para iniciar (30 segundos)..."
+sleep 30
+
+# Verificar salud
+echo ""
+echo "🏥 Verificando salud de servicios..."
+
+HEALTHY=0
+TOTAL=10
+
+# Verificar FastAPI
+if curl -s http://localhost/health > /dev/null 2>&1; then
+    echo "  ✅ FastAPI API"
+    HEALTHY=$((HEALTHY + 1))
+else
+    echo "  ⏳ FastAPI (iniciando...)"
+fi
+
+# Verificar Kafka
+if docker compose exec -T kafka kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1; then
+    echo "  ✅ Kafka"
+    HEALTHY=$((HEALTHY + 1))
+else
+    echo "  ⏳ Kafka (iniciando...)"
+fi
+
+# Verificar MinIO
+if curl -s http://localhost:9000/minio/health/live > /dev/null 2>&1; then
+    echo "  ✅ MinIO"
+    HEALTHY=$((HEALTHY + 1))
+else
+    echo "  ⏳ MinIO (iniciando...)"
+fi
+
+echo ""
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║              PLATAFORMA INICIADA EXITOSAMENTE             ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "📊 ACCESO A SERVICIOS:"
+echo ""
+echo "  🌐 API Docs (FastAPI):"
+echo "     http://localhost/docs"
+echo ""
+echo "  🪣 MinIO Console:"
+echo "     http://localhost:9001"
+echo "     Credenciales: minioadmin / minioadmin"
+echo ""
+echo "  Capas de datos (todo en MinIO):"
+echo "     - Bronze: datos crudos (JSON)"
+echo "     - Silver: datos limpios (Parquet)"
+echo "     - Gold: métricas e incidentes (JSON)"
+echo ""
+echo "  📈 Datadog (si está configurado):"
+echo "     https://app.datadoghq.com"
+echo ""
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                    PRÓXIMOS PASOS                          ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "1️⃣  VER LOGS DE GENERADOR:"
+echo "    docker compose logs -f generator"
+echo ""
+
+echo "2️⃣  VERIFICAR ESTADO:"
+echo "    docker compose ps"
+echo ""
+
+echo "3️⃣  PROBAR API:"
+echo "    curl http://localhost/health"
+echo ""
+
+echo "4️⃣  VERIFICAR DATOS EN BRONZE:"
+echo "    docker compose exec minio mc ls local/bronze/raw"
+echo ""
+
+echo "5️⃣  CONSULTAR GOLD (MinIO):"
+echo "    docker compose exec minio mc ls local/gold/hourly_metrics/"
+echo ""
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                    DOCUMENTACIÓN                           ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "📚 Documentación Disponible:"
+echo "   - README.md              : Guía general"
+echo "   - docs/Architecture.md   : Arquitectura detallada"
+echo "   - docs/Pipeline.md       : Flujo de datos"
+echo "   - docs/Medallion.md      : Patrón Medallion"
+echo "   - docs/Observability.md  : Monitoreo y métricas"
+echo "   - docs/Deployment.md     : Despliegue y escalado"
+echo "   - docs/ADR.md            : Decisiones arquitectónicas"
+echo "   - docs/Testing.md        : Guía de testing"
+echo ""
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                   DATADOG (OPCIONAL)                       ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "Para habilitar Datadog:"
+echo ""
+echo "  export DD_API_KEY='tu_api_key_aqui'"
+echo "  docker compose restart datadog-agent"
+echo ""
+echo "  Luego acceder a: https://app.datadoghq.com"
+echo ""
+
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                   PARAR LA PLATAFORMA                      ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+echo "  docker compose down"
+echo ""
+
+echo "📝 Para limpiar datos:"
+echo "  bash scripts/clean.sh"
+echo ""
+
+echo "✅ ¡Plataforma lista para usar!"
+</file>
+
+<file path="scripts/clean.sh">
+#!/bin/bash
+
+# Script para limpiar la plataforma
+
+echo "¿Estás seguro de que deseas limpiar todos los datos? (s/n)"
+read -r response
+
+if [ "$response" != "s" ]; then
+    echo "Cancelado"
+    exit 0
+fi
+
+echo "Deteniendo servicios..."
+docker compose down
+
+echo "Eliminando volúmenes..."
+docker volume rm \
+    et-ingenier-a-de-datos_minio_data \
+    et-ingenier-a-de-datos_datadog_socket || true
+
+echo "Eliminando directorios de datos..."
+rm -rf data/{bronze,silver,gold}/*
+
+echo "✓ Limpieza completada"
+</file>
+
+<file path="scripts/init.sh">
+#!/bin/bash
+
+# Script de inicialización de la plataforma
+# Uso: bash init.sh
+
+set -e
+
+echo "================================"
+echo "Data Platform - Initialization"
+echo "================================"
+
+# Colores
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+# Verificar Docker
+echo -e "${YELLOW}[1/5] Verificando Docker...${NC}"
+if ! command -v docker &> /dev/null; then
+    echo -e "${RED}Error: Docker no está instalado${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Docker OK${NC}"
+
+# Verificar Docker Compose
+echo -e "${YELLOW}[2/5] Verificando Docker Compose...${NC}"
+if ! command -v docker compose &> /dev/null; then
+    echo -e "${RED}Error: Docker Compose no está instalado${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Docker Compose OK${NC}"
+
+# Crear directorios necesarios
+echo -e "${YELLOW}[3/5] Creando directorios...${NC}"
+mkdir -p data/{bronze,silver,gold,minio}
+echo -e "${GREEN}✓ Directorios creados${NC}"
+
+# Configurar variables de entorno
+echo -e "${YELLOW}[4/5] Configurando variables de entorno...${NC}"
+if [ ! -f .env ]; then
+    cat > .env << EOF
+# Datadog
+DD_API_KEY=test_key_local_only
+
+# Kafka
+KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+KAFKA_TOPIC=raw_events
+
+# MinIO
+MINIO_ENDPOINT=minio:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+
+# Gold (MinIO buckets)
+MINIO_BUCKET_BRONZE=bronze
+MINIO_BUCKET_SILVER=silver
+MINIO_BUCKET_GOLD=gold
+EOF
+    echo -e "${GREEN}✓ Archivo .env creado${NC}"
+else
+    echo -e "${GREEN}✓ Archivo .env ya existe${NC}"
+fi
+
+# Levantar servicios
+echo -e "${YELLOW}[5/5] Levantando servicios Docker...${NC}"
+docker compose up -d
+
+echo ""
+echo -e "${GREEN}================================${NC}"
+echo -e "${GREEN}Inicialización completada!${NC}"
+echo -e "${GREEN}================================${NC}"
+echo ""
+echo "Servicios en ejecución:"
+echo "  - Zookeeper: localhost:2181"
+echo "  - Kafka: localhost:9092"
+echo "  - MinIO: http://localhost:9000"
+echo "  - MinIO Console: http://localhost:9001"
+echo "  - FastAPI Docs: http://localhost/docs"
+echo "  - Datadog Agent: localhost:8126"
+echo ""
+echo "Capas de datos (todo en MinIO):"
+echo "  - Bronze: eventos crudos desde Kafka"
+echo "  - Silver: datos limpios y enriquecidos (Parquet)"
+echo "  - Gold: métricas agregadas e incidentes (JSON)"
+echo ""
+echo "Credenciales MinIO: minioadmin / minioadmin"
+echo ""
+echo "Próximos pasos:"
+echo "  1. Verificar servicios: docker compose ps"
+echo "  2. Ver logs: docker compose logs -f"
+echo "  3. Consultar API: curl http://localhost/health"
+echo ""
+echo "Para usar Datadog:"
+echo "  export DD_API_KEY='your_real_api_key'"
+echo "  docker compose restart datadog-agent"
+echo ""
+</file>
+
+<file path="scripts/test.sh">
+#!/bin/bash
+
+# Script para ejecutar pruebas en la plataforma
+
+echo "================================"
+echo "Testing Data Platform"
+echo "================================"
+echo ""
+
+# Test 1: Health Check
+echo "[Test 1] Health Check..."
+curl -s http://localhost/health | jq .
+echo ""
+
+# Test 2: Generate test event
+echo "[Test 2] Verificar generador de eventos..."
+docker compose logs generator | grep "Batch produced" | tail -1
+echo ""
+
+# Test 3: Check Kafka topic
+echo "[Test 3] Verificar Kafka..."
+docker compose exec kafka kafka-consumer-groups.sh \
+    --bootstrap-server localhost:9092 \
+    --group bronze_workers \
+    --describe 2>/dev/null || echo "No consumer group info available"
+echo ""
+
+# Test 4: Check MinIO buckets
+echo "[Test 4] Verificar MinIO buckets..."
+docker compose exec minio mc ls local/bronze 2>/dev/null || echo "No bronze data yet"
+echo ""
+
+# Test 5: Check MinIO Gold layer (replaces MongoDB)
+echo "[Test 5] Verificar MinIO (Gold/processed data)..."
+docker compose exec minio mc ls local/gold 2>/dev/null || echo "No gold data yet"
+echo ""
+
+# Test 6: API endpoints
+echo "[Test 6] Probar API endpoints..."
+echo "GET /api/v1/stats/database"
+curl -s http://localhost/api/v1/stats/database | jq .
+echo ""
+
+# Test 7: Request a metrics
+echo "[Test 7] Probar GET /api/v1/metrics/hourly..."
+curl -s "http://localhost/api/v1/metrics/hourly?limit=1" | jq . | head -20
+echo ""
+
+echo "================================"
+echo "Testing completado!"
+echo "================================"
+</file>
+
+<file path="streaming_worker/otel_setup.py">
+import logging
+import os
+from typing import Optional, Tuple
+
+from opentelemetry import metrics, trace
+from opentelemetry._logs import set_logger_provider
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+
+def _build_otlp_exporter(exporter_cls, endpoint: str, timeout: int = 10):
+    try:
+        return exporter_cls(endpoint=endpoint, insecure=True, timeout=timeout)
+    except TypeError:
+        return exporter_cls(endpoint=endpoint, timeout=timeout)
+
+
+def configure_observability(
+    service_name: str,
+    log_level: int = logging.INFO,
+    service_version: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> Tuple[object, object, object]:
+    """Configure OpenTelemetry exporters for traces, metrics, and logs."""
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://datadog-agent:4318")
+    endpoint = endpoint.rstrip("/")
+
+    # Control whether to send logs via OTLP. Many local Datadog agent
+    # installations don't expose an OTLP logs HTTP endpoint, so keep
+    # this disabled by default and rely on the Datadog agent's
+    # container log collection instead.
+    send_logs = os.getenv("OTEL_EXPORTER_OTLP_SEND_LOGS", "false").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+    resource = Resource.create(
+        {
+            "service.name": service_name,
+            "service.version": service_version or os.getenv("SERVICE_VERSION", "dev"),
+            "deployment.environment": environment or os.getenv("OTEL_ENVIRONMENT", "local"),
+        }
+    )
+
+    metric_reader = PeriodicExportingMetricReader(
+        _build_otlp_exporter(OTLPMetricExporter, f"{endpoint}/v1/metrics"),
+        export_interval_millis=10000,
+    )
+    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
+
+    tracer_provider = TracerProvider(resource=resource)
+    tracer_provider.add_span_processor(
+        BatchSpanProcessor(
+            _build_otlp_exporter(OTLPSpanExporter, f"{endpoint}/v1/traces")
+        )
+    )
+    trace.set_tracer_provider(tracer_provider)
+
+    logger_provider = None
+    if send_logs:
+        logger_provider = LoggerProvider(resource=resource)
+        logger_provider.add_log_record_processor(
+            BatchLogRecordProcessor(
+                _build_otlp_exporter(OTLPLogExporter, f"{endpoint}/v1/logs")
+            )
+        )
+        set_logger_provider(logger_provider)
+
+        root_logger = logging.getLogger()
+        root_logger.setLevel(log_level)
+        root_logger.addHandler(LoggingHandler(level=log_level, logger_provider=logger_provider))
+
+    meter = metrics.get_meter(service_name)
+    tracer = trace.get_tracer(service_name)
+    return meter, tracer, logger_provider
+</file>
+
+<file path="streaming_worker/requirements.txt">
+kafka-python==2.0.2
+boto3==1.28.0
+python-snappy==0.7.3
+opentelemetry-api==1.31.0
+opentelemetry-sdk==1.31.0
+opentelemetry-exporter-otlp-proto-http==1.31.0
+opentelemetry-instrumentation==0.52b0
+python-statsd==2.1.0
+</file>
+
+<file path="streaming_worker/worker.py">
+import json
+import logging
+import os
+import time
+from datetime import datetime
+from typing import Optional
+
+import boto3
+from kafka import KafkaConsumer
+from kafka.admin import KafkaAdminClient, NewTopic
+from opentelemetry import metrics, trace
+
+try:
+    from statsd import StatsClient as _StatsClient
+except Exception:
+    try:
+        from statsd.client import StatsClient as _StatsClient
+    except Exception:
+        _StatsClient = None
+
+from otel_setup import configure_observability
+
+
+class _NoOpStatsClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def increment(self, *args, **kwargs):
+        return None
+
+    def gauge(self, *args, **kwargs):
+        return None
+
+    def histogram(self, *args, **kwargs):
+        return None
+
+
+def _build_statsd_client(prefix: str):
+    if _StatsClient is None:
+        return _NoOpStatsClient()
+
+    try:
+        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
+    except Exception:
+        return _NoOpStatsClient()
+
+# ============================================
+# LOGGING
+# ============================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# OBSERVABILIDAD
+# ============================================
+
+meter, tracer, _ = configure_observability("streaming-worker")
+
+statsd_client = _build_statsd_client('streaming_worker')
+
+# ============================================
+# MÉTRICAS
+# ============================================
+
+messages_consumed = meter.create_counter(
+    name="messages_consumed",
+    description="Total messages consumed",
+    unit="1"
+)
+
+messages_stored = meter.create_counter(
+    name="messages_stored",
+    description="Total messages stored in bronze",
+    unit="1"
+)
+
+consumer_lag = meter.create_gauge(
+    name="consumer_lag",
+    description="Consumer lag",
+    unit="1"
+)
+
+processing_latency = meter.create_histogram(
+    name="processing_latency_ms",
+    description="Message processing latency",
+    unit="ms"
+)
+
+# ============================================
+# CONFIGURACIÓN
+# ============================================
+
+KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:29092')
+KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'raw_events')
+KAFKA_GROUP_ID = os.getenv('KAFKA_GROUP_ID', 'bronze_workers')
+
+MINIO_ENDPOINT = os.getenv('MINIO_ENDPOINT', 'minio:9000')
+MINIO_ACCESS_KEY = os.getenv('MINIO_ACCESS_KEY', 'minioadmin')
+MINIO_SECRET_KEY = os.getenv('MINIO_SECRET_KEY', 'minioadmin')
+MINIO_BUCKET = os.getenv('MINIO_BUCKET', 'bronze')
+
+# ============================================
+# CLIENTE MINIO
+# ============================================
+
+class MinIOClient:
+    def __init__(self):
+        self.s3_client = boto3.client(
+            's3',
+            endpoint_url=f'http://{MINIO_ENDPOINT}',
+            aws_access_key_id=MINIO_ACCESS_KEY,
+            aws_secret_access_key=MINIO_SECRET_KEY,
+            region_name='us-east-1'
+        )
+        self.bucket = MINIO_BUCKET
+        self._ensure_bucket_exists()
+
+    def _ensure_bucket_exists(self):
+        """Crear bucket si no existe"""
+        try:
+            self.s3_client.head_bucket(Bucket=self.bucket)
+            logger.info(f"Bucket {self.bucket} exists")
+        except Exception:
+            logger.info(f"Creating bucket {self.bucket}")
+            self.s3_client.create_bucket(Bucket=self.bucket)
+
+    def store_event(self, event: dict, timestamp: str) -> bool:
+        """Almacenar evento en MinIO"""
+        try:
+            with tracer.start_as_current_span("minio_store"):
+                date_partition = timestamp.split('T')[0]
+                hour_partition = timestamp.split('T')[1].split(':')[0]
+                key = f"raw/date={date_partition}/hour={hour_partition}/{int(time.time() * 1000)}.json"
+                
+                self.s3_client.put_object(
+                    Bucket=self.bucket,
+                    Key=key,
+                    Body=json.dumps(event, default=str).encode('utf-8'),
+                    ContentType='application/json'
+                )
+                
+                messages_stored.add(1)
+                statsd_client.increment('messages.stored')
+                return True
+        except Exception as e:
+            logger.error(f"Error storing event in MinIO: {str(e)}")
+            statsd_client.increment('messages.store_failed')
+            return False
+
+# ============================================
+# STREAMING WORKER
+# ============================================
+
+class StreamingWorker:
+    def __init__(self):
+        self.consumer: Optional[KafkaConsumer] = None
+        self.minio_client = MinIOClient()
+
+    def ensure_topic(self):
+        """Asegurar que el topic exista y esté limpio para la ingesta de Bronze."""
+        try:
+            admin_client = KafkaAdminClient(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS], client_id='worker-admin')
+            topics = admin_client.list_topics()
+            if KAFKA_TOPIC in topics:
+                admin_client.delete_topics([KAFKA_TOPIC], timeout_ms=10000)
+                time.sleep(2)
+            admin_client.create_topics([NewTopic(name=KAFKA_TOPIC, num_partitions=1, replication_factor=1)], timeout_ms=10000)
+            admin_client.close()
+            logger.info(f"Ensured Kafka topic {KAFKA_TOPIC} exists")
+        except Exception as exc:
+            logger.warning(f"Topic bootstrap skipped: {exc}")
+
+    def connect_kafka(self):
+        """Conectar a Kafka"""
+        retry_count = 0
+        max_retries = 5
+        
+        while retry_count < max_retries:
+            try:
+                self.ensure_topic()
+                self.consumer = KafkaConsumer(
+                    KAFKA_TOPIC,
+                    bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
+                    group_id=KAFKA_GROUP_ID,
+                    value_deserializer=lambda m: json.loads(m.decode('utf-8')),
+                    auto_offset_reset='earliest',
+                    enable_auto_commit=True,
+                    max_poll_records=100,
+                    session_timeout_ms=30000,
+                    request_timeout_ms=40000
+                )
+                logger.info(f"Connected to Kafka topic {KAFKA_TOPIC}")
+                statsd_client.gauge('kafka_connection_attempts', retry_count)
+                return True
+            except Exception as e:
+                retry_count += 1
+                logger.warning(f"Kafka connection attempt {retry_count}/{max_retries} failed: {str(e)}")
+                if retry_count < max_retries:
+                    time.sleep(5)
+                else:
+                    logger.error(f"Failed to connect to Kafka after {max_retries} attempts")
+                    return False
+
+    def process_messages(self):
+        """Procesar mensajes de Kafka"""
+        if not self.connect_kafka():
+            logger.error("Failed to connect to Kafka")
+            return
+
+        logger.info("Starting to consume messages")
+        batch_count = 0
+
+        try:
+            while True:
+                with tracer.start_as_current_span("consume_batch"):
+                    messages = self.consumer.poll(timeout_ms=1000, max_records=100)
+                    
+                    if not messages:
+                        continue
+
+                    for topic_partition, records in messages.items():
+                        with tracer.start_as_current_span("process_partition"):
+                            for record in records:
+                                start_time = time.time()
+                                
+                                try:
+                                    event = record.value
+                                    timestamp = event.get('timestamp', datetime.utcnow().isoformat())
+                                    
+                                    if self.minio_client.store_event(event, timestamp):
+                                        messages_consumed.add(1)
+                                        statsd_client.increment('messages.consumed')
+                                    
+                                    elapsed = (time.time() - start_time) * 1000
+                                    processing_latency.record(elapsed)
+                                    
+                                except Exception as e:
+                                    logger.error(f"Error processing message: {str(e)}")
+                                    statsd_client.increment('messages.processing_failed')
+
+                    batch_count += 1
+                    if batch_count % 10 == 0:
+                        logger.info(f"Processed {batch_count} batches")
+
+        except KeyboardInterrupt:
+            logger.info("Worker stopped by user")
+        except Exception as e:
+            logger.error(f"Critical error in worker: {str(e)}")
+        finally:
+            if self.consumer:
+                self.consumer.close()
+            logger.info("Kafka connection closed")
+
+# ============================================
+# MAIN
+# ============================================
+
+if __name__ == "__main__":
+    worker = StreamingWorker()
+    worker.process_messages()
 </file>
 
 <file path="etl/etl_spark.py">
@@ -6495,93 +7212,6 @@ if __name__ == "__main__":
     transformer.run_scheduler()
 </file>
 
-<file path="etl/otel_setup.py">
-import logging
-import os
-from typing import Optional, Tuple
-
-from opentelemetry import metrics, trace
-from opentelemetry._logs import set_logger_provider
-from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
-
-def _build_otlp_exporter(exporter_cls, endpoint: str, timeout: int = 10):
-    try:
-        return exporter_cls(endpoint=endpoint, insecure=True, timeout=timeout)
-    except TypeError:
-        return exporter_cls(endpoint=endpoint, timeout=timeout)
-
-
-def configure_observability(
-    service_name: str,
-    log_level: int = logging.INFO,
-    service_version: Optional[str] = None,
-    environment: Optional[str] = None,
-) -> Tuple[object, object, object]:
-    """Configure OpenTelemetry exporters for traces, metrics, and logs."""
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://datadog-agent:4318")
-    endpoint = endpoint.rstrip("/")
-
-    # Control whether to send logs via OTLP. Many local Datadog agent
-    # installations don't expose an OTLP logs HTTP endpoint, so keep
-    # this disabled by default and rely on the Datadog agent's
-    # container log collection instead.
-    send_logs = os.getenv("OTEL_EXPORTER_OTLP_SEND_LOGS", "false").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
-
-    resource = Resource.create(
-        {
-            "service.name": service_name,
-            "service.version": service_version or os.getenv("SERVICE_VERSION", "dev"),
-            "deployment.environment": environment or os.getenv("OTEL_ENVIRONMENT", "local"),
-        }
-    )
-
-    metric_reader = PeriodicExportingMetricReader(
-        _build_otlp_exporter(OTLPMetricExporter, f"{endpoint}/v1/metrics"),
-        export_interval_millis=10000,
-    )
-    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
-
-    tracer_provider = TracerProvider(resource=resource)
-    tracer_provider.add_span_processor(
-        BatchSpanProcessor(
-            _build_otlp_exporter(OTLPSpanExporter, f"{endpoint}/v1/traces")
-        )
-    )
-    trace.set_tracer_provider(tracer_provider)
-
-    logger_provider = None
-    if send_logs:
-        logger_provider = LoggerProvider(resource=resource)
-        logger_provider.add_log_record_processor(
-            BatchLogRecordProcessor(
-                _build_otlp_exporter(OTLPLogExporter, f"{endpoint}/v1/logs")
-            )
-        )
-        set_logger_provider(logger_provider)
-
-        root_logger = logging.getLogger()
-        root_logger.setLevel(log_level)
-        root_logger.addHandler(LoggingHandler(level=log_level, logger_provider=logger_provider))
-
-    meter = metrics.get_meter(service_name)
-    tracer = trace.get_tracer(service_name)
-    return meter, tracer, logger_provider
-</file>
-
 <file path="etl/requirements_gold.txt">
 boto3==1.28.0
 pyarrow==16.0.0
@@ -7128,636 +7758,6 @@ if __name__ == "__main__":
         port=8000,
         log_level="info"
     )
-</file>
-
-<file path="fastapi_service/otel_setup.py">
-import logging
-import os
-from typing import Optional, Tuple
-
-from opentelemetry import metrics, trace
-from opentelemetry._logs import set_logger_provider
-from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
-
-def _build_otlp_exporter(exporter_cls, endpoint: str, timeout: int = 10):
-    try:
-        return exporter_cls(endpoint=endpoint, insecure=True, timeout=timeout)
-    except TypeError:
-        return exporter_cls(endpoint=endpoint, timeout=timeout)
-
-
-def configure_observability(
-    service_name: str,
-    log_level: int = logging.INFO,
-    service_version: Optional[str] = None,
-    environment: Optional[str] = None,
-) -> Tuple[object, object, object]:
-    """Configure OpenTelemetry exporters for traces, metrics, and logs."""
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://datadog-agent:4318")
-    endpoint = endpoint.rstrip("/")
-
-    # Control whether to send logs via OTLP. Many local Datadog agent
-    # installations don't expose an OTLP logs HTTP endpoint, so keep
-    # this disabled by default and rely on the Datadog agent's
-    # container log collection instead.
-    send_logs = os.getenv("OTEL_EXPORTER_OTLP_SEND_LOGS", "false").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
-
-    resource = Resource.create(
-        {
-            "service.name": service_name,
-            "service.version": service_version or os.getenv("SERVICE_VERSION", "dev"),
-            "deployment.environment": environment or os.getenv("OTEL_ENVIRONMENT", "local"),
-        }
-    )
-
-    metric_reader = PeriodicExportingMetricReader(
-        _build_otlp_exporter(OTLPMetricExporter, f"{endpoint}/v1/metrics"),
-        export_interval_millis=10000,
-    )
-    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
-
-    tracer_provider = TracerProvider(resource=resource)
-    tracer_provider.add_span_processor(
-        BatchSpanProcessor(
-            _build_otlp_exporter(OTLPSpanExporter, f"{endpoint}/v1/traces")
-        )
-    )
-    trace.set_tracer_provider(tracer_provider)
-
-    logger_provider = None
-    if send_logs:
-        logger_provider = LoggerProvider(resource=resource)
-        logger_provider.add_log_record_processor(
-            BatchLogRecordProcessor(
-                _build_otlp_exporter(OTLPLogExporter, f"{endpoint}/v1/logs")
-            )
-        )
-        set_logger_provider(logger_provider)
-
-        root_logger = logging.getLogger()
-        root_logger.setLevel(log_level)
-        root_logger.addHandler(LoggingHandler(level=log_level, logger_provider=logger_provider))
-
-    meter = metrics.get_meter(service_name)
-    tracer = trace.get_tracer(service_name)
-    return meter, tracer, logger_provider
-</file>
-
-<file path="fastapi_service/requirements.txt">
-fastapi==0.115.0
-uvicorn[standard]==0.32.0
-boto3==1.28.0
-pydantic==2.9.2
-opentelemetry-api==1.31.0
-opentelemetry-sdk==1.31.0
-opentelemetry-exporter-otlp-proto-http==1.31.0
-opentelemetry-instrumentation-fastapi==0.52b0
-opentelemetry-instrumentation-requests==0.52b0
-opentelemetry-instrumentation==0.52b0
-python-statsd==2.1.0
-</file>
-
-<file path="generator/otel_setup.py">
-import logging
-import os
-from typing import Optional, Tuple
-
-from opentelemetry import metrics, trace
-from opentelemetry._logs import set_logger_provider
-from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
-
-def _build_otlp_exporter(exporter_cls, endpoint: str, timeout: int = 10):
-    try:
-        return exporter_cls(endpoint=endpoint, insecure=True, timeout=timeout)
-    except TypeError:
-        return exporter_cls(endpoint=endpoint, timeout=timeout)
-
-
-def configure_observability(
-    service_name: str,
-    log_level: int = logging.INFO,
-    service_version: Optional[str] = None,
-    environment: Optional[str] = None,
-) -> Tuple[object, object, object]:
-    """Configure OpenTelemetry exporters for traces, metrics, and logs."""
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://datadog-agent:4318")
-    endpoint = endpoint.rstrip("/")
-
-    # Control whether to send logs via OTLP. Many local Datadog agent
-    # installations don't expose an OTLP logs HTTP endpoint, so keep
-    # this disabled by default and rely on the Datadog agent's
-    # container log collection instead.
-    send_logs = os.getenv("OTEL_EXPORTER_OTLP_SEND_LOGS", "false").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
-
-    resource = Resource.create(
-        {
-            "service.name": service_name,
-            "service.version": service_version or os.getenv("SERVICE_VERSION", "dev"),
-            "deployment.environment": environment or os.getenv("OTEL_ENVIRONMENT", "local"),
-        }
-    )
-
-    metric_reader = PeriodicExportingMetricReader(
-        _build_otlp_exporter(OTLPMetricExporter, f"{endpoint}/v1/metrics"),
-        export_interval_millis=10000,
-    )
-    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
-
-    tracer_provider = TracerProvider(resource=resource)
-    tracer_provider.add_span_processor(
-        BatchSpanProcessor(
-            _build_otlp_exporter(OTLPSpanExporter, f"{endpoint}/v1/traces")
-        )
-    )
-    trace.set_tracer_provider(tracer_provider)
-
-    logger_provider = None
-    if send_logs:
-        logger_provider = LoggerProvider(resource=resource)
-        logger_provider.add_log_record_processor(
-            BatchLogRecordProcessor(
-                _build_otlp_exporter(OTLPLogExporter, f"{endpoint}/v1/logs")
-            )
-        )
-        set_logger_provider(logger_provider)
-
-        root_logger = logging.getLogger()
-        root_logger.setLevel(log_level)
-        root_logger.addHandler(LoggingHandler(level=log_level, logger_provider=logger_provider))
-
-    meter = metrics.get_meter(service_name)
-    tracer = trace.get_tracer(service_name)
-    return meter, tracer, logger_provider
-</file>
-
-<file path="QUICKSTART.sh">
-#!/bin/bash
-
-# ============================================
-# QUICK START - Data Platform MVP
-# ============================================
-
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║   Data Platform MVP - Data Engineering Architecture       ║"
-echo "║   Medallion Architecture with Full Observability          ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-# Verificar Docker
-echo "📦 Verificando requisitos..."
-if ! command -v docker &> /dev/null; then
-    echo "❌ Docker no está instalado. Por favor instalar Docker Desktop."
-    exit 1
-fi
-
-if ! command -v docker compose &> /dev/null; then
-    echo "❌ Docker Compose no está instalado."
-    exit 1
-fi
-
-echo "✅ Docker instalado"
-echo ""
-
-# Mostrar servicios
-echo "🚀 Iniciando servicios..."
-echo ""
-echo "Servicios que se levantarán:"
-echo "  ✓ Zookeeper (2181)"
-echo "  ✓ Kafka (9092)"
-echo "  ✓ MinIO S3 (9000, 9001)"
-echo "  ✓ Datadog Agent (8126)"
-echo "  ✓ Data Generator"
-echo "  ✓ Streaming Worker (Bronze)"
-echo "  ✓ ETL Spark (Silver)"
-echo "  ✓ Gold Transformer (Gold)"
-echo "  ✓ FastAPI (8000)"
-echo "  ✓ Nginx Proxy (80, 443)"
-echo ""
-
-# Levantar servicios
-docker compose up -d
-
-echo "⏳ Esperando servicios para iniciar (30 segundos)..."
-sleep 30
-
-# Verificar salud
-echo ""
-echo "🏥 Verificando salud de servicios..."
-
-HEALTHY=0
-TOTAL=10
-
-# Verificar FastAPI
-if curl -s http://localhost/health > /dev/null 2>&1; then
-    echo "  ✅ FastAPI API"
-    HEALTHY=$((HEALTHY + 1))
-else
-    echo "  ⏳ FastAPI (iniciando...)"
-fi
-
-# Verificar Kafka
-if docker compose exec -T kafka kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1; then
-    echo "  ✅ Kafka"
-    HEALTHY=$((HEALTHY + 1))
-else
-    echo "  ⏳ Kafka (iniciando...)"
-fi
-
-# Verificar MinIO
-if curl -s http://localhost:9000/minio/health/live > /dev/null 2>&1; then
-    echo "  ✅ MinIO"
-    HEALTHY=$((HEALTHY + 1))
-else
-    echo "  ⏳ MinIO (iniciando...)"
-fi
-
-echo ""
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║              PLATAFORMA INICIADA EXITOSAMENTE             ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "📊 ACCESO A SERVICIOS:"
-echo ""
-echo "  🌐 API Docs (FastAPI):"
-echo "     http://localhost/docs"
-echo ""
-echo "  🪣 MinIO Console:"
-echo "     http://localhost:9001"
-echo "     Credenciales: minioadmin / minioadmin"
-echo ""
-echo "  Capas de datos (todo en MinIO):"
-echo "     - Bronze: datos crudos (JSON)"
-echo "     - Silver: datos limpios (Parquet)"
-echo "     - Gold: métricas e incidentes (JSON)"
-echo ""
-echo "  📈 Datadog (si está configurado):"
-echo "     https://app.datadoghq.com"
-echo ""
-
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║                    PRÓXIMOS PASOS                          ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "1️⃣  VER LOGS DE GENERADOR:"
-echo "    docker compose logs -f generator"
-echo ""
-
-echo "2️⃣  VERIFICAR ESTADO:"
-echo "    docker compose ps"
-echo ""
-
-echo "3️⃣  PROBAR API:"
-echo "    curl http://localhost/health"
-echo ""
-
-echo "4️⃣  VERIFICAR DATOS EN BRONZE:"
-echo "    docker compose exec minio mc ls local/bronze/raw"
-echo ""
-
-echo "5️⃣  CONSULTAR GOLD (MinIO):"
-echo "    docker compose exec minio mc ls local/gold/hourly_metrics/"
-echo ""
-
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║                    DOCUMENTACIÓN                           ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "📚 Documentación Disponible:"
-echo "   - README.md              : Guía general"
-echo "   - docs/Architecture.md   : Arquitectura detallada"
-echo "   - docs/Pipeline.md       : Flujo de datos"
-echo "   - docs/Medallion.md      : Patrón Medallion"
-echo "   - docs/Observability.md  : Monitoreo y métricas"
-echo "   - docs/Deployment.md     : Despliegue y escalado"
-echo "   - docs/ADR.md            : Decisiones arquitectónicas"
-echo "   - docs/Testing.md        : Guía de testing"
-echo ""
-
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║                   DATADOG (OPCIONAL)                       ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "Para habilitar Datadog:"
-echo ""
-echo "  export DD_API_KEY='tu_api_key_aqui'"
-echo "  docker compose restart datadog-agent"
-echo ""
-echo "  Luego acceder a: https://app.datadoghq.com"
-echo ""
-
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║                   PARAR LA PLATAFORMA                      ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
-
-echo "  docker compose down"
-echo ""
-
-echo "📝 Para limpiar datos:"
-echo "  bash scripts/clean.sh"
-echo ""
-
-echo "✅ ¡Plataforma lista para usar!"
-</file>
-
-<file path="scripts/clean.sh">
-#!/bin/bash
-
-# Script para limpiar la plataforma
-
-echo "¿Estás seguro de que deseas limpiar todos los datos? (s/n)"
-read -r response
-
-if [ "$response" != "s" ]; then
-    echo "Cancelado"
-    exit 0
-fi
-
-echo "Deteniendo servicios..."
-docker compose down
-
-echo "Eliminando volúmenes..."
-docker volume rm \
-    et-ingenier-a-de-datos_minio_data \
-    et-ingenier-a-de-datos_datadog_socket || true
-
-echo "Eliminando directorios de datos..."
-rm -rf data/{bronze,silver,gold}/*
-
-echo "✓ Limpieza completada"
-</file>
-
-<file path="scripts/init.sh">
-#!/bin/bash
-
-# Script de inicialización de la plataforma
-# Uso: bash init.sh
-
-set -e
-
-echo "================================"
-echo "Data Platform - Initialization"
-echo "================================"
-
-# Colores
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-# Verificar Docker
-echo -e "${YELLOW}[1/5] Verificando Docker...${NC}"
-if ! command -v docker &> /dev/null; then
-    echo -e "${RED}Error: Docker no está instalado${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Docker OK${NC}"
-
-# Verificar Docker Compose
-echo -e "${YELLOW}[2/5] Verificando Docker Compose...${NC}"
-if ! command -v docker compose &> /dev/null; then
-    echo -e "${RED}Error: Docker Compose no está instalado${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Docker Compose OK${NC}"
-
-# Crear directorios necesarios
-echo -e "${YELLOW}[3/5] Creando directorios...${NC}"
-mkdir -p data/{bronze,silver,gold,minio}
-echo -e "${GREEN}✓ Directorios creados${NC}"
-
-# Configurar variables de entorno
-echo -e "${YELLOW}[4/5] Configurando variables de entorno...${NC}"
-if [ ! -f .env ]; then
-    cat > .env << EOF
-# Datadog
-DD_API_KEY=test_key_local_only
-
-# Kafka
-KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-KAFKA_TOPIC=raw_events
-
-# MinIO
-MINIO_ENDPOINT=minio:9000
-MINIO_ACCESS_KEY=minioadmin
-MINIO_SECRET_KEY=minioadmin
-
-# Gold (MinIO buckets)
-MINIO_BUCKET_BRONZE=bronze
-MINIO_BUCKET_SILVER=silver
-MINIO_BUCKET_GOLD=gold
-EOF
-    echo -e "${GREEN}✓ Archivo .env creado${NC}"
-else
-    echo -e "${GREEN}✓ Archivo .env ya existe${NC}"
-fi
-
-# Levantar servicios
-echo -e "${YELLOW}[5/5] Levantando servicios Docker...${NC}"
-docker compose up -d
-
-echo ""
-echo -e "${GREEN}================================${NC}"
-echo -e "${GREEN}Inicialización completada!${NC}"
-echo -e "${GREEN}================================${NC}"
-echo ""
-echo "Servicios en ejecución:"
-echo "  - Zookeeper: localhost:2181"
-echo "  - Kafka: localhost:9092"
-echo "  - MinIO: http://localhost:9000"
-echo "  - MinIO Console: http://localhost:9001"
-echo "  - FastAPI Docs: http://localhost/docs"
-echo "  - Datadog Agent: localhost:8126"
-echo ""
-echo "Capas de datos (todo en MinIO):"
-echo "  - Bronze: eventos crudos desde Kafka"
-echo "  - Silver: datos limpios y enriquecidos (Parquet)"
-echo "  - Gold: métricas agregadas e incidentes (JSON)"
-echo ""
-echo "Credenciales MinIO: minioadmin / minioadmin"
-echo ""
-echo "Próximos pasos:"
-echo "  1. Verificar servicios: docker compose ps"
-echo "  2. Ver logs: docker compose logs -f"
-echo "  3. Consultar API: curl http://localhost/health"
-echo ""
-echo "Para usar Datadog:"
-echo "  export DD_API_KEY='your_real_api_key'"
-echo "  docker compose restart datadog-agent"
-echo ""
-</file>
-
-<file path="scripts/test.sh">
-#!/bin/bash
-
-# Script para ejecutar pruebas en la plataforma
-
-echo "================================"
-echo "Testing Data Platform"
-echo "================================"
-echo ""
-
-# Test 1: Health Check
-echo "[Test 1] Health Check..."
-curl -s http://localhost/health | jq .
-echo ""
-
-# Test 2: Generate test event
-echo "[Test 2] Verificar generador de eventos..."
-docker compose logs generator | grep "Batch produced" | tail -1
-echo ""
-
-# Test 3: Check Kafka topic
-echo "[Test 3] Verificar Kafka..."
-docker compose exec kafka kafka-consumer-groups.sh \
-    --bootstrap-server localhost:9092 \
-    --group bronze_workers \
-    --describe 2>/dev/null || echo "No consumer group info available"
-echo ""
-
-# Test 4: Check MinIO buckets
-echo "[Test 4] Verificar MinIO buckets..."
-docker compose exec minio mc ls local/bronze 2>/dev/null || echo "No bronze data yet"
-echo ""
-
-# Test 5: Check MinIO Gold layer (replaces MongoDB)
-echo "[Test 5] Verificar MinIO (Gold/processed data)..."
-docker compose exec minio mc ls local/gold 2>/dev/null || echo "No gold data yet"
-echo ""
-
-# Test 6: API endpoints
-echo "[Test 6] Probar API endpoints..."
-echo "GET /api/v1/stats/database"
-curl -s http://localhost/api/v1/stats/database | jq .
-echo ""
-
-# Test 7: Request a metrics
-echo "[Test 7] Probar GET /api/v1/metrics/hourly..."
-curl -s "http://localhost/api/v1/metrics/hourly?limit=1" | jq . | head -20
-echo ""
-
-echo "================================"
-echo "Testing completado!"
-echo "================================"
-</file>
-
-<file path="streaming_worker/otel_setup.py">
-import logging
-import os
-from typing import Optional, Tuple
-
-from opentelemetry import metrics, trace
-from opentelemetry._logs import set_logger_provider
-from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
-
-def _build_otlp_exporter(exporter_cls, endpoint: str, timeout: int = 10):
-    try:
-        return exporter_cls(endpoint=endpoint, insecure=True, timeout=timeout)
-    except TypeError:
-        return exporter_cls(endpoint=endpoint, timeout=timeout)
-
-
-def configure_observability(
-    service_name: str,
-    log_level: int = logging.INFO,
-    service_version: Optional[str] = None,
-    environment: Optional[str] = None,
-) -> Tuple[object, object, object]:
-    """Configure OpenTelemetry exporters for traces, metrics, and logs."""
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://datadog-agent:4318")
-    endpoint = endpoint.rstrip("/")
-
-    # Control whether to send logs via OTLP. Many local Datadog agent
-    # installations don't expose an OTLP logs HTTP endpoint, so keep
-    # this disabled by default and rely on the Datadog agent's
-    # container log collection instead.
-    send_logs = os.getenv("OTEL_EXPORTER_OTLP_SEND_LOGS", "false").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
-
-    resource = Resource.create(
-        {
-            "service.name": service_name,
-            "service.version": service_version or os.getenv("SERVICE_VERSION", "dev"),
-            "deployment.environment": environment or os.getenv("OTEL_ENVIRONMENT", "local"),
-        }
-    )
-
-    metric_reader = PeriodicExportingMetricReader(
-        _build_otlp_exporter(OTLPMetricExporter, f"{endpoint}/v1/metrics"),
-        export_interval_millis=10000,
-    )
-    metrics.set_meter_provider(MeterProvider(resource=resource, metric_readers=[metric_reader]))
-
-    tracer_provider = TracerProvider(resource=resource)
-    tracer_provider.add_span_processor(
-        BatchSpanProcessor(
-            _build_otlp_exporter(OTLPSpanExporter, f"{endpoint}/v1/traces")
-        )
-    )
-    trace.set_tracer_provider(tracer_provider)
-
-    logger_provider = None
-    if send_logs:
-        logger_provider = LoggerProvider(resource=resource)
-        logger_provider.add_log_record_processor(
-            BatchLogRecordProcessor(
-                _build_otlp_exporter(OTLPLogExporter, f"{endpoint}/v1/logs")
-            )
-        )
-        set_logger_provider(logger_provider)
-
-        root_logger = logging.getLogger()
-        root_logger.setLevel(log_level)
-        root_logger.addHandler(LoggingHandler(level=log_level, logger_provider=logger_provider))
-
-    meter = metrics.get_meter(service_name)
-    tracer = trace.get_tracer(service_name)
-    return meter, tracer, logger_provider
 </file>
 
 </files>

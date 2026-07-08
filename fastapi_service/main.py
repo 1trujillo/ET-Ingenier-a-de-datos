@@ -84,6 +84,12 @@ request_duration = meter.create_histogram(
     unit="ms"
 )
 
+recovery_time = meter.create_histogram(
+    name="service.recovery_time_ms",
+    description="Time to recover service after a connection failure",
+    unit="ms"
+)
+
 # ============================================
 # CONFIGURACIÓN
 # ============================================
@@ -199,19 +205,42 @@ app = FastAPI(
 
 # Variable global para el cliente MinIO
 minio_client: Optional[MinIOClient] = None
+failure_start_time: Optional[float] = None
 
 FastAPIInstrumentor.instrument_app(app)
 
 @app.on_event("startup")
 async def startup_event():
     """Inicializar conexión a MinIO"""
-    global minio_client
-    try:
-        minio_client = MinIOClient()
-        logger.info("API started successfully - connected to MinIO gold layer")
-    except Exception as e:
-        logger.error(f"Failed to initialize MinIO client: {str(e)}")
-        raise
+    global minio_client, failure_start_time
+    if failure_start_time is None:
+        failure_start_time = time.time()
+
+    retry_count = 0
+    max_retries = 5
+    while retry_count < max_retries:
+        try:
+            minio_client = MinIOClient()
+            logger.info("API started successfully - connected to MinIO gold layer")
+
+            if failure_start_time is not None:
+                recovery_ms = (time.time() - failure_start_time) * 1000
+                recovery_time.record(recovery_ms, attributes={'service': 'fastapi'})
+                try:
+                    statsd_client.histogram('service.recovery_time_ms', recovery_ms, tags=['service:fastapi'])
+                except TypeError:
+                    statsd_client.histogram('service.recovery_time_ms', recovery_ms)
+                failure_start_time = None
+                logger.info(f"FastAPI recovered after {recovery_ms:.2f} ms")
+            return
+
+        except Exception as e:
+            retry_count += 1
+            logger.warning(f"MinIO connection attempt {retry_count}/{max_retries} failed: {str(e)}")
+            if retry_count >= max_retries:
+                logger.error(f"Failed to initialize MinIO client after {max_retries} attempts")
+                raise
+            time.sleep(3)
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -226,6 +255,7 @@ async def shutdown_event():
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
+    global failure_start_time
     start_time = time.time()
 
     try:
@@ -233,7 +263,19 @@ async def health_check():
             requests_total.add(1)
 
             if not minio_client.health_check():
+                if failure_start_time is None:
+                    failure_start_time = time.time()
                 raise HTTPException(status_code=503, detail="MinIO not available")
+
+            if failure_start_time is not None:
+                recovery_ms = (time.time() - failure_start_time) * 1000
+                recovery_time.record(recovery_ms, attributes={'service': 'fastapi'})
+                try:
+                    statsd_client.histogram('service.recovery_time_ms', recovery_ms, tags=['service:fastapi'])
+                except TypeError:
+                    statsd_client.histogram('service.recovery_time_ms', recovery_ms)
+                failure_start_time = None
+                logger.info(f"FastAPI recovered after {recovery_ms:.2f} ms")
 
             elapsed = (time.time() - start_time) * 1000
             request_duration.record(elapsed)
@@ -244,6 +286,8 @@ async def health_check():
                 "service": "data-platform-api"
             }
     except Exception as e:
+        if failure_start_time is None:
+            failure_start_time = time.time()
         logger.error(f"Health check failed: {str(e)}")
         raise HTTPException(status_code=503, detail="Service unavailable")
 
@@ -319,7 +363,7 @@ async def get_incidents(
     start_time = time.time()
 
     try:
-        with tracer.start_as_current_span("get_incidents"):
+        with tracer.start_as_current_span("api.get_incidents.query"):
             requests_total.add(1)
 
             # Leer todos los datos de incident_reports desde MinIO
@@ -347,6 +391,9 @@ async def get_incidents(
             elapsed = (time.time() - start_time) * 1000
             request_duration.record(elapsed)
             statsd_client.histogram('endpoint.incidents.duration_ms', elapsed)
+            statsd_client.histogram('api.incidents.query_latency_ms', elapsed)
+
+            statsd_client.gauge('api.incidents.query_count', len(results))
 
             return results
     except Exception as e:

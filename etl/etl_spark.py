@@ -94,6 +94,18 @@ etl_duration = meter.create_histogram(
     unit="s"
 )
 
+pipeline_success_rate = meter.create_gauge(
+    name="pipeline.success_rate_pct",
+    description="Percentage of clean records after validation vs total loaded from bronze",
+    unit="%"
+)
+
+pipeline_throughput = meter.create_gauge(
+    name="pipeline.throughput.events_per_min",
+    description="Silver layer throughput normalized to events per minute",
+    unit="events/min"
+)
+
 # ============================================
 # CONFIGURACIÓN
 # ============================================
@@ -283,9 +295,17 @@ class SparkETL:
                 if df is None:
                     logger.warning("No data to process")
                     return
+
+                total_loaded = df.count()
                 
                 # Validar y limpiar
                 df = self.validate_and_clean(df)
+                records_after_validation = df.count()
+
+                invalid_count = total_loaded - records_after_validation
+                if invalid_count > 0:
+                    records_invalid.add(invalid_count)
+                    statsd_client.increment('records.invalid', invalid_count)
                 
                 # Enriquecer
                 df = self.enrich_data(df)
@@ -296,6 +316,24 @@ class SparkETL:
                 elapsed = time.time() - start_time
                 etl_duration.record(elapsed)
                 statsd_client.histogram('etl.duration_seconds', elapsed)
+
+                # --- NEW: success rate % ---
+                if total_loaded > 0:
+                    success_pct = (records_after_validation / total_loaded) * 100
+                    pipeline_success_rate.set(success_pct)
+                    try:
+                        statsd_client.gauge('pipeline.success_rate_pct', success_pct)
+                    except Exception:
+                        pass
+
+                # --- NEW: throughput events/min ---
+                if elapsed > 0:
+                    throughput_val = (records_after_validation / elapsed) * 60
+                    pipeline_throughput.set(throughput_val)
+                    try:
+                        statsd_client.gauge('pipeline.throughput.events_per_min', throughput_val)
+                    except Exception:
+                        pass
                 
                 logger.info(f"ETL completed in {elapsed:.2f} seconds")
                 

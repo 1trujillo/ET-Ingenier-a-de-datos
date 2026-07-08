@@ -68,6 +68,7 @@ generator/Dockerfile
 generator/generator.py
 generator/otel_setup.py
 generator/requirements.txt
+main.py
 monitoring/datadog-agent.yaml
 monitoring/monitors-config.yaml
 monitoring/nginx.conf
@@ -75,6 +76,7 @@ package.json
 PROJECT_STATUS.txt
 PROJECT_SUMMARY.md
 QUICKSTART.sh
+README_TESTS.md
 README.md
 scripts/clean.sh
 scripts/health-check.sh
@@ -86,12 +88,781 @@ streaming_worker/Dockerfile
 streaming_worker/otel_setup.py
 streaming_worker/requirements.txt
 streaming_worker/worker.py
+test.py
 tmp_check.py
+tmp_test.py
 VERIFICATION.md
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="main.py">
+import os
+import queue
+import random
+import statistics
+import threading
+import time
+from collections import Counter
+from dataclasses import dataclass
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - optional dependency
+    requests = None
+
+
+@dataclass
+class Event:
+    """Synthetic mobility event produced by sensors or cameras."""
+
+    comuna: str
+    tipo_evento: str
+    velocidad: float
+    timestamp: str
+    corrupted: bool = False
+    source: str = "sensor"
+
+
+class UrbanMobilityPipeline:
+    """Simulates a streaming ETL pipeline with synthetic load and failures."""
+
+    def __init__(self, name: str = "urban-pipeline", batch_size: int = 25):
+        self.name = name
+        self.batch_size = batch_size
+        self.event_queue: "queue.Queue[Event]" = queue.Queue(maxsize=500)
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+
+        self.total_events = 0
+        self.successful_events = 0
+        self.failed_events = 0
+        self.accidents_by_comuna = Counter()
+        self.batch_durations = []
+        self.queue_depth_samples = []
+
+    def _build_event(self, scenario: str) -> Event:
+        comunas = ["santiago", "las_condes", "ñuñoa", "maipu", "providencia"]
+        tipos = ["vehiculo", "semaforo", "accidente"]
+
+        if scenario == "accident_spike":
+            if random.random() < 0.55:
+                return Event(
+                    comuna="santiago",
+                    tipo_evento="accidente",
+                    velocidad=max(0.0, random.gauss(12, 5)),
+                    timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    corrupted=False,
+                    source="camera",
+                )
+
+        if scenario == "error":
+            # Inject a high rate of corrupted events for the error scenario.
+            # Increase probability to aggressively force failures during testing.
+            if random.random() < 0.75:
+                # Return an event that will always fail validation (None fields, invalid speed)
+                return Event(
+                    comuna=None,
+                    tipo_evento=None,
+                    velocidad=-999,
+                    timestamp="",
+                    corrupted=True,
+                    source="sensor",
+                )
+
+        if random.random() < 0.10:
+            tipo = "accidente"
+            comuna = random.choice(["santiago", "maipu", "ñuñoa"])
+            velocidad = max(0.0, random.gauss(15, 6))
+        else:
+            tipo = random.choice(tipos)
+            comuna = random.choice(comunas)
+            velocidad = max(0.0, random.gauss(40, 12))
+
+        if scenario == "high_load" and random.random() < 0.08:
+            velocidad = max(0.0, random.gauss(60, 20))
+
+        return Event(
+            comuna=comuna,
+            tipo_evento=tipo,
+            velocidad=velocidad,
+            timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            corrupted=False,
+            source="sensor",
+        )
+
+    def _is_valid_event(self, event: Event) -> bool:
+        if event.corrupted:
+            return False
+        if not event.comuna or not event.tipo_evento or not event.timestamp:
+            return False
+        if event.velocidad is None or event.velocidad < 0 or event.velocidad > 180:
+            return False
+        return True
+
+    def _process_event(self, event: Event) -> None:
+        self.total_events += 1
+
+        # Simulate ETL processing time and occasional latency spikes.
+        processing_delay = random.uniform(0.001, 0.004)
+        if event.tipo_evento == "accidente":
+            processing_delay += 0.002
+        # Base processing time
+        time.sleep(processing_delay)
+
+        # If the event is explicitly marked corrupted, add extra latency to
+        # simulate retry/backoff or additional validation cost, then mark as failed.
+        if event.corrupted:
+            time.sleep(0.005)
+            # Corrupted events always fail validation path
+            self.failed_events += 1
+            return
+
+        # Small chance of hard failure for otherwise-valid events to simulate
+        # random downstream errors (network, DB contention, etc.). 5% is a
+        # realistic small-failure probability under stress.
+        if random.random() < 0.05:
+            self.failed_events += 1
+            return
+
+        if self._is_valid_event(event):
+            self.successful_events += 1
+            if event.tipo_evento == "accidente":
+                self.accidents_by_comuna[event.comuna] += 1
+        else:
+            self.failed_events += 1
+
+    def _process_batch(self, batch: list[Event]) -> None:
+        batch_start = time.perf_counter()
+        for event in batch:
+            self._process_event(event)
+        self.batch_durations.append(time.perf_counter() - batch_start)
+
+    def _producer(self, scenario: str, target_rate_per_sec: float, duration_seconds: int) -> None:
+        end_time = time.time() + duration_seconds
+        while time.time() < end_time and not self.stop_event.is_set():
+            self.event_queue.put(self._build_event(scenario))
+            interval = max(0.0, 1.0 / target_rate_per_sec)
+            time.sleep(interval)
+
+    def _consumer(self) -> None:
+        while not self.stop_event.is_set() or not self.event_queue.empty():
+            batch = []
+            while len(batch) < self.batch_size:
+                try:
+                    batch.append(self.event_queue.get(timeout=0.1))
+                except queue.Empty:
+                    break
+
+            if not batch:
+                time.sleep(0.005)
+                continue
+
+            self._process_batch(batch)
+            self.queue_depth_samples.append(self.event_queue.qsize())
+
+    def _emit_metrics(self, scenario: str, started_at: float, final: bool = False) -> None:
+        elapsed = max(time.time() - started_at, 1e-6)
+        total = self.total_events
+        success_rate = (self.successful_events / total * 100.0) if total else 0.0
+        throughput = (self.total_events / (elapsed / 60.0)) if elapsed else 0.0
+        etl_duration = statistics.mean(self.batch_durations) if self.batch_durations else 0.0
+
+        send_metric(
+            "pipeline.success_rate_pct",
+            round(success_rate, 2),
+            ["env:test", f"scenario:{scenario}"],
+        )
+        send_metric(
+            "pipeline.throughput.events_per_min",
+            round(throughput, 2),
+            ["env:test", f"scenario:{scenario}"],
+        )
+        send_metric(
+            "etl_duration_seconds",
+            round(etl_duration, 4),
+            ["env:test", f"scenario:{scenario}"],
+        )
+        send_metric(
+            "events_failed",
+            self.failed_events,
+            ["env:test", f"scenario:{scenario}"],
+        )
+
+        for comuna, count in sorted(self.accidents_by_comuna.items()):
+            send_metric(
+                "movilidad.accidentes_por_comuna",
+                count,
+                ["env:test", f"scenario:{scenario}", f"comuna:{comuna}"],
+            )
+
+        print(
+            f"[{scenario}] processed={total} success_rate={success_rate:.2f}% "
+            f"failed={self.failed_events} throughput={throughput:.2f} evt/min "
+            f"etl_batch={etl_duration:.4f}s queue={self.event_queue.qsize()}"
+        )
+
+        if final:
+            print(f"[{scenario}] summary -> accidents={dict(self.accidents_by_comuna)}")
+
+    def run(self, duration_seconds: int, scenario: str, target_rate_per_sec: float = 120.0) -> dict:
+        started_at = time.time()
+        self.stop_event.clear()
+
+        producer = threading.Thread(
+            target=self._producer,
+            args=(scenario, target_rate_per_sec, duration_seconds),
+            daemon=True,
+        )
+        consumer = threading.Thread(target=self._consumer, daemon=True)
+
+        producer.start()
+        consumer.start()
+
+        while time.time() < started_at + duration_seconds:
+            self._emit_metrics(scenario, started_at)
+            time.sleep(1.0)
+
+        self.stop_event.set()
+        producer.join(timeout=2)
+        consumer.join(timeout=2)
+        self._emit_metrics(scenario, started_at, final=True)
+
+        return {
+            "scenario": scenario,
+            "total_events": self.total_events,
+            "successful_events": self.successful_events,
+            "failed_events": self.failed_events,
+            "success_rate_pct": round((self.successful_events / self.total_events * 100.0) if self.total_events else 0.0, 2),
+            "throughput_events_per_min": round((self.total_events / (max(time.time() - started_at, 1e-6) / 60.0)) if time.time() - started_at else 0.0, 2),
+            "etl_duration_seconds": round(statistics.mean(self.batch_durations) if self.batch_durations else 0.0, 4),
+            "accidents_by_comuna": dict(self.accidents_by_comuna),
+        }
+
+
+def send_metric(name: str, value: float, tags: list[str] | None = None) -> None:
+    """Print the metric and optionally forward it to a Datadog-like endpoint."""
+
+    tags = tags or []
+    print(f"[METRIC] {name}={value} tags={tags}")
+
+    if not os.getenv("DATADOG_URL"):
+        return
+
+    if requests is None:
+        print("[DATADOG] requests package is not installed; skipping API send")
+        return
+
+    try:
+        requests.post(
+            os.getenv("DATADOG_URL"),
+            json={"series": [{"metric": name, "points": [[int(time.time()), value]], "tags": tags}]},
+            timeout=0.2,
+        )
+    except Exception as exc:  # pragma: no cover - network simulation
+        print(f"[DATADOG] send failed: {exc}")
+
+
+def run_scenario(name: str, duration_seconds: int = 30, batch_size: int = 25, target_rate_per_sec: float = 120.0) -> dict:
+    pipeline = UrbanMobilityPipeline(name=name, batch_size=batch_size)
+    return pipeline.run(duration_seconds=duration_seconds, scenario=name.lower().replace(" ", "_"), target_rate_per_sec=target_rate_per_sec)
+
+
+if __name__ == "__main__":
+    print("Starting urban mobility pipeline simulation...")
+    result = run_scenario("NORMAL LOAD", duration_seconds=10, batch_size=20, target_rate_per_sec=80)
+    print("Completed.")
+    print(result)
+</file>
+
+<file path="README_TESTS.md">
+README - Cómo ejecutar los tests de la simulación de movilidad urbana
+=====================================================================
+
+Resumen
+-------
+Este repositorio incluye una simulación de pipeline de datos en tiempo real (ingestión → ETL → salida) que emite métricas similares a Datadog. El runner de pruebas (`test.py`) ejecuta escenarios diseñados para estresar y maximizar métricas como:
+
+- `movilidad.accidentes_por_comuna`
+- `pipeline.success_rate_pct`
+- `pipeline.throughput.events_per_min`
+- `etl_duration_seconds`
+- `events_failed`
+
+Archivos clave
+-------------
+- `main.py`  : implementación del pipeline y función `run_scenario(...)`.
+- `test.py`  : runner con 4 escenarios (NORMAL LOAD, HIGH LOAD, ERROR SCENARIO, ACCIDENT SPIKE SCENARIO).
+
+Requisitos
+---------
+- Python 3.8+
+- Paquete opcional: `requests` (solo si quieres que las métricas se envíen a un endpoint HTTP simulado).
+
+Instalación rápida
+-----------------
+Recomendado: crear un entorno virtual e instalar `requests` si lo necesita.
+
+Windows (cmd/powershell):
+
+```powershell
+python -m venv .venv
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+# O en cmd
+.\.venv\Scripts\activate.bat
+pip install requests
+```
+
+Linux / macOS:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install requests
+```
+
+Cómo ejecutar los tests
+----------------------
+Ejecutar el conjunto completo de escenarios (por defecto cada escenario se ejecuta durante el número de segundos indicado con `--duration`):
+
+```bash
+python test.py --duration 30
+```
+
+Parámetros útiles:
+- `--duration`: duración en segundos de cada escenario (ej. `--duration 60`).
+- `--batch-size`: tamaño del batch de ETL (ej. `--batch-size 50`).
+
+Ejemplos:
+
+- Ejecutar todos los escenarios durante 60 segundos cada uno:
+
+```bash
+python test.py --duration 60
+```
+
+- Ejecutar con batches más grandes (aumenta carga por batch):
+
+```bash
+python test.py --duration 30 --batch-size 50
+```
+
+Correr solo la simulación rápida desde `main.py`:
+
+```bash
+python main.py
+```
+
+Simular envío a Datadog (opcional)
+---------------------------------
+Para que la función `send_metric(...)` intente enviar las métricas a un endpoint HTTP (simulando Datadog), exporta la variable `DATADOG_URL` antes de ejecutar.
+
+Windows (cmd):
+
+```cmd
+set DATADOG_URL=http://localhost:8126/v1/series
+python test.py --duration 30
+```
+
+PowerShell:
+
+```powershell
+$env:DATADOG_URL = 'http://localhost:8126/v1/series'
+python test.py --duration 30
+```
+
+Linux / macOS:
+
+```bash
+export DATADOG_URL="http://localhost:8126/v1/series"
+python test.py --duration 30
+```
+
+Salida esperada
+---------------
+Durante la ejecución verás líneas de log con métricas en consola, por ejemplo:
+
+```
+[METRIC] pipeline.success_rate_pct=97.5 tags=['env:test', 'scenario:high_load']
+[METRIC] pipeline.throughput.events_per_min=12000.0 tags=[...]
+[METRIC] etl_duration_seconds=0.0958 tags=[...]
+[METRIC] events_failed=12 tags=[...]
+[METRIC] movilidad.accidentes_por_comuna=42 tags=[..., 'comuna:santiago']
+```
+
+Al final de cada escenario se imprimirá un resumen con:
+- total_events
+- successful_events
+- failed_events
+- success_rate_pct
+- throughput_events_per_min
+- etl_duration_seconds
+- accidents_by_comuna
+
+Cómo aumentar la carga / ajustar comportamiento
+---------------------------------------------
+- Subir `target_rate_per_sec` en `test.py` (la lista `scenarios` contiene pares `(label, target_rate)`), o modificar los valores para escenarios individuales.
+- Aumentar `--batch-size` para procesar más eventos por batch.
+- Cambiar la duración `--duration` para pruebas más largas.
+- Para forzar más eventos corruptos o picos de accidentes, editar las condiciones en `_build_event` dentro de `main.py`.
+
+Sugerencias para monitoreo y dashboard
+------------------------------------
+- Grafica `pipeline.throughput.events_per_min` en un eje y `etl_duration_seconds` en otro para detectar cuellos de botella.
+- Usar `movilidad.accidentes_por_comuna` por comuna para crear alertas de picos locales.
+- Crear alertas en `events_failed` para detectar degradación del pipeline.
+
+Problemas comunes
+-----------------
+- Si no ves métricas HTTP enviadas, asegúrate de tener `DATADOG_URL` definida y que `requests` esté instalado.
+- Si la CPU local se satura al aumentar `target_rate_per_sec`, reduce `batch-size` o ejecuta en una máquina más potente.
+
+Próximos pasos (opcional)
+-------------------------
+- Añadir un script `requirements.txt` o `pyproject.toml` para gestionar dependencias.
+- Empaquetar la simulación en un contenedor Docker para pruebas reproducibles.
+
+Contacto
+--------
+Si quieres que adapte escenarios concretos o que añada más métricas/outputs, dime qué necesitas y lo implemento.
+
+- python test.py --duration 60 --batch-size 50
+</file>
+
+<file path="test.py">
+import argparse
+import time
+from typing import Any
+
+from main import run_scenario
+
+
+def print_header(title: str) -> None:
+    print("\n" + "=" * 72)
+    print(title)
+    print("=" * 72)
+
+
+def dump_summary(summary: dict[str, Any]) -> None:
+    print("\n--- Scenario summary ---")
+    for key in [
+        "scenario",
+        "total_events",
+        "successful_events",
+        "failed_events",
+        "success_rate_pct",
+        "throughput_events_per_min",
+        "etl_duration_seconds",
+        "accidents_by_comuna",
+    ]:
+        print(f"{key}={summary.get(key)}")
+
+
+def report_result(label: str, failures: list[str]) -> bool:
+    if failures:
+        print(f"[FAIL] {label}")
+        for reason in failures:
+            print(f"  - {reason}")
+        return False
+
+    print(f"[OK] {label}")
+    return True
+
+
+def validate_normal(summary: dict[str, Any]) -> bool:
+    failures = []
+    if summary["total_events"] < 100:
+        failures.append("El pipeline no procesó suficientes eventos en carga normal")
+    if summary["success_rate_pct"] < 85.0:
+        failures.append(f"Tasa de éxito baja: {summary['success_rate_pct']}% < 85%")
+    if summary["throughput_events_per_min"] < 5000:
+        failures.append(f"Throughput insuficiente en normal: {summary['throughput_events_per_min']}")
+    return report_result("NORMAL LOAD", failures)
+
+
+def validate_high_load(summary: dict[str, Any], target_rate_per_sec: float) -> bool:
+    failures = []
+    expected_throughput_min = target_rate_per_sec * 60 * 0.70
+    if summary["throughput_events_per_min"] < expected_throughput_min:
+        failures.append(
+            f"Throughput no alcanzó el 70% del objetivo: {summary['throughput_events_per_min']} < {expected_throughput_min:.0f}"
+        )
+    if summary["success_rate_pct"] < 70.0:
+        failures.append(f"Tasa de éxito demasiado baja en alta carga: {summary['success_rate_pct']}% < 70%")
+    if summary["etl_duration_seconds"] > 1.2:
+        failures.append(f"Duración de lote ETL excesiva: {summary['etl_duration_seconds']}s > 1.2s")
+    return report_result("HIGH LOAD", failures)
+
+
+def validate_error_scenario(summary: dict[str, Any]) -> bool:
+    failures = []
+    if summary["failed_events"] <= 0:
+        failures.append("No se detectaron eventos fallidos en ERROR SCENARIO")
+    if summary["success_rate_pct"] >= 95.0:
+        failures.append(f"Tasa de éxito demasiado alta en ERROR SCENARIO: {summary['success_rate_pct']}% >= 95%")
+    if summary["total_events"] < 100:
+        failures.append("No se generaron suficientes eventos para validar el escenario de error")
+    return report_result("ERROR SCENARIO", failures)
+
+
+def validate_accident_spike(summary: dict[str, Any]) -> bool:
+    failures = []
+    total_accidents = sum(summary.get("accidents_by_comuna", {}).values())
+    if total_accidents <= 0:
+        failures.append("No se detectaron accidentes durante el spike")
+    if not any(count >= 20 for count in summary.get("accidents_by_comuna", {}).values()):
+        failures.append("No hay un pico lo suficientemente alto de accidentes por comuna")
+    if summary["throughput_events_per_min"] < 2000:
+        failures.append(f"Throughput bajo en ACCIDENT SPIKE: {summary['throughput_events_per_min']}")
+    return report_result("ACCIDENT SPIKE", failures)
+
+
+def validate_max_stress(summary: dict[str, Any], target_rate_per_sec: float) -> bool:
+    failures = []
+    expected_throughput_min = target_rate_per_sec * 60 * 0.65
+    if summary["throughput_events_per_min"] < expected_throughput_min:
+        failures.append(
+            f"No se alcanzó la presión esperada: {summary['throughput_events_per_min']} < {expected_throughput_min:.0f} evt/min"
+        )
+    if summary["etl_duration_seconds"] > 1.5:
+        failures.append(f"Procesamiento de lote demasiado lento bajo estrés máximo: {summary['etl_duration_seconds']}s")
+    if summary["success_rate_pct"] < 60.0:
+        failures.append(f"Tasa de éxito excesivamente baja en estrés máximo: {summary['success_rate_pct']}% < 60%")
+    if summary["failed_events"] < 5:
+        failures.append("No se introdujeron suficientes errores reales bajo estrés máximo")
+    return report_result("MAXIMUM STRESS", failures)
+
+
+def run_scenario_and_validate(
+    label: str,
+    duration: int,
+    batch_size: int,
+    target_rate_per_sec: float,
+    validator: Any,
+) -> bool:
+    print_header(f"RUNNING SCENARIO: {label}")
+    summary = run_scenario(
+        label,
+        duration_seconds=duration,
+        batch_size=batch_size,
+        target_rate_per_sec=target_rate_per_sec,
+    )
+    dump_summary(summary)
+    return validator(summary) if validator else True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Stress test runner for urban mobility pipeline")
+    parser.add_argument("--duration", type=int, default=45, help="Seconds per scenario")
+    parser.add_argument("--batch-size", type=int, default=50, help="Events per ETL batch")
+    parser.add_argument("--normal-rate", type=float, default=180.0, help="Events/sec for NORMAL LOAD")
+    parser.add_argument("--high-rate", type=float, default=480.0, help="Events/sec for HIGH LOAD")
+    parser.add_argument("--error-rate", type=float, default=340.0, help="Events/sec for ERROR SCENARIO")
+    parser.add_argument("--accident-rate", type=float, default=240.0, help="Events/sec for ACCIDENT SPIKE")
+    parser.add_argument("--max-rate", type=float, default=620.0, help="Events/sec for MAXIMUM STRESS")
+    args = parser.parse_args()
+
+    scenarios = [
+        ("NORMAL LOAD", args.normal_rate, validate_normal),
+        ("HIGH LOAD", args.high_rate, lambda summary: validate_high_load(summary, args.high_rate)),
+        ("ERROR SCENARIO", args.error_rate, validate_error_scenario),
+        ("ACCIDENT SPIKE", args.accident_rate, validate_accident_spike),
+        ("MAXIMUM STRESS", args.max_rate, lambda summary: validate_max_stress(summary, args.max_rate)),
+    ]
+
+    print_header("URBAN MOBILITY PIPELINE STRESS TEST RUNNER")
+    passed = 0
+    failed = 0
+
+    for label, rate, validator in scenarios:
+        ok = run_scenario_and_validate(label, duration=args.duration, batch_size=args.batch_size, target_rate_per_sec=rate, validator=validator)
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        time.sleep(3)
+
+    print_header("FINAL TEST RESULT")
+    print(f"passed={passed} failed={failed}")
+    if failed == 0:
+        print("✅ ALL SCENARIOS PASSED")
+    else:
+        print("❌ AT LEAST ONE SCENARIO FAILED")
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="tmp_test.py">
+import argparse
+import time
+from typing import Any
+
+from main import run_scenario
+
+
+def print_header(title: str) -> None:
+    print("\n" + "=" * 72)
+    print(title)
+    print("=" * 72)
+
+
+def dump_summary(summary: dict[str, Any]) -> None:
+    print("\n--- Scenario summary ---")
+    for key in [
+        "scenario",
+        "total_events",
+        "successful_events",
+        "failed_events",
+        "success_rate_pct",
+        "throughput_events_per_min",
+        "etl_duration_seconds",
+        "accidents_by_comuna",
+    ]:
+        print(f"{key}={summary.get(key)}")
+
+
+def report_result(label: str, failures: list[str]) -> bool:
+    if failures:
+        print(f"[FAIL] {label}")
+        for reason in failures:
+            print(f"  - {reason}")
+        return False
+
+    print(f"[OK] {label}")
+    return True
+
+
+def validate_normal(summary: dict[str, Any]) -> bool:
+    failures = []
+    if summary["total_events"] < 100:
+        failures.append("El pipeline no procesó suficientes eventos en carga normal")
+    if summary["success_rate_pct"] < 85.0:
+        failures.append(f"Tasa de éxito baja: {summary['success_rate_pct']}% < 85%")
+    if summary["throughput_events_per_min"] < 5000:
+        failures.append(f"Throughput insuficiente en normal: {summary['throughput_events_per_min']}")
+    return report_result("NORMAL LOAD", failures)
+
+
+def validate_high_load(summary: dict[str, Any], target_rate_per_sec: float) -> bool:
+    failures = []
+    expected_throughput_min = target_rate_per_sec * 60 * 0.70
+    if summary["throughput_events_per_min"] < expected_throughput_min:
+        failures.append(
+            f"Throughput no alcanzó el 70% del objetivo: {summary['throughput_events_per_min']} < {expected_throughput_min:.0f}"
+        )
+    if summary["success_rate_pct"] < 70.0:
+        failures.append(f"Tasa de éxito demasiado baja en alta carga: {summary['success_rate_pct']}% < 70%")
+    if summary["etl_duration_seconds"] > 1.2:
+        failures.append(f"Duración de lote ETL excesiva: {summary['etl_duration_seconds']}s > 1.2s")
+    return report_result("HIGH LOAD", failures)
+
+
+def validate_error_scenario(summary: dict[str, Any]) -> bool:
+    failures = []
+    if summary["failed_events"] <= 0:
+        failures.append("No se detectaron eventos fallidos en ERROR SCENARIO")
+    if summary["success_rate_pct"] >= 95.0:
+        failures.append(f"Tasa de éxito demasiado alta en ERROR SCENARIO: {summary['success_rate_pct']}% >= 95%")
+    if summary["total_events"] < 100:
+        failures.append("No se generaron suficientes eventos para validar el escenario de error")
+    return report_result("ERROR SCENARIO", failures)
+
+
+def validate_accident_spike(summary: dict[str, Any]) -> bool:
+    failures = []
+    total_accidents = sum(summary.get("accidents_by_comuna", {}).values())
+    if total_accidents <= 0:
+        failures.append("No se detectaron accidentes durante el spike")
+    if not any(count >= 20 for count in summary.get("accidents_by_comuna", {}).values()):
+        failures.append("No hay un pico lo suficientemente alto de accidentes por comuna")
+    if summary["throughput_events_per_min"] < 2000:
+        failures.append(f"Throughput bajo en ACCIDENT SPIKE: {summary['throughput_events_per_min']}")
+    return report_result("ACCIDENT SPIKE", failures)
+
+
+def validate_max_stress(summary: dict[str, Any], target_rate_per_sec: float) -> bool:
+    failures = []
+    expected_throughput_min = target_rate_per_sec * 60 * 0.65
+    if summary["throughput_events_per_min"] < expected_throughput_min:
+        failures.append(
+            f"No se alcanzó la presión esperada: {summary['throughput_events_per_min']} < {expected_throughput_min:.0f} evt/min"
+        )
+    if summary["etl_duration_seconds"] > 1.5:
+        failures.append(f"Procesamiento de lote demasiado lento bajo estrés máximo: {summary['etl_duration_seconds']}s")
+    if summary["success_rate_pct"] < 60.0:
+        failures.append(f"Tasa de éxito excesivamente baja en estrés máximo: {summary['success_rate_pct']}% < 60%")
+    if summary["failed_events"] < 5:
+        failures.append("No se introdujeron suficientes errores reales bajo estrés máximo")
+    return report_result("MAXIMUM STRESS", failures)
+
+
+def run_scenario_and_validate(
+    label: str,
+    duration: int,
+    batch_size: int,
+    target_rate_per_sec: float,
+    validator: Any,
+) -> bool:
+    print_header(f"RUNNING SCENARIO: {label}")
+    summary = run_scenario(
+        label,
+        duration_seconds=duration,
+        batch_size=batch_size,
+        target_rate_per_sec=target_rate_per_sec,
+    )
+    dump_summary(summary)
+    return validator(summary) if validator else True
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Stress test runner for urban mobility pipeline")
+    parser.add_argument("--duration", type=int, default=45, help="Seconds per scenario")
+    parser.add_argument("--batch-size", type=int, default=50, help="Events per ETL batch")
+    parser.add_argument("--normal-rate", type=float, default=180.0, help="Events/sec for NORMAL LOAD")
+    parser.add_argument("--high-rate", type=float, default=480.0, help="Events/sec for HIGH LOAD")
+    parser.add_argument("--error-rate", type=float, default=340.0, help="Events/sec for ERROR SCENARIO")
+    parser.add_argument("--accident-rate", type=float, default=240.0, help="Events/sec for ACCIDENT SPIKE")
+    parser.add_argument("--max-rate", type=float, default=620.0, help="Events/sec for MAXIMUM STRESS")
+    args = parser.parse_args()
+
+    scenarios = [
+        ("NORMAL LOAD", args.normal_rate, validate_normal),
+        ("HIGH LOAD", args.high_rate, lambda summary: validate_high_load(summary, args.high_rate)),
+        ("ERROR SCENARIO", args.error_rate, validate_error_scenario),
+        ("ACCIDENT SPIKE", args.accident_rate, validate_accident_spike),
+        ("MAXIMUM STRESS", args.max_rate, lambda summary: validate_max_stress(summary, args.max_rate)),
+    ]
+
+    print_header("URBAN MOBILITY PIPELINE STRESS TEST RUNNER")
+    passed = 0
+    failed = 0
+
+    for label, rate, validator in scenarios:
+        ok = run_scenario_and_validate(label, duration=args.duration, batch_size=args.batch_size, target_rate_per_sec=rate, validator=validator)
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        time.sleep(3)
+
+    print_header("FINAL TEST RESULT")
+    print(f"passed={passed} failed={failed}")
+    if failed == 0:
+        print("✅ ALL SCENARIOS PASSED")
+    else:
+        print("❌ AT LEAST ONE SCENARIO FAILED")
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
+'@; Set-Content -Path tmp_test.py -Value $content -Encoding UTF8"
+</file>
 
 <file path="check_minio.py">
 import boto3
@@ -5124,326 +5895,6 @@ opentelemetry-instrumentation==0.52b0
 python-statsd==2.1.0
 </file>
 
-<file path="generator/generator.py">
-import json
-import logging
-import random
-import time
-from datetime import datetime, timedelta
-from typing import Dict, Any
-
-import numpy as np
-from kafka import KafkaProducer
-from kafka.admin import KafkaAdminClient, NewTopic
-from opentelemetry import metrics, trace
-
-try:
-    from statsd import StatsClient as _StatsClient
-except Exception:
-    try:
-        from statsd.client import StatsClient as _StatsClient
-    except Exception:
-        _StatsClient = None
-
-from otel_setup import configure_observability
-
-
-class _NoOpStatsClient:
-    def __init__(self, *args, **kwargs):
-        pass
-
-    def increment(self, *args, **kwargs):
-        return None
-
-    def gauge(self, *args, **kwargs):
-        return None
-
-    def histogram(self, *args, **kwargs):
-        return None
-
-
-def _build_statsd_client(prefix: str):
-    if _StatsClient is None:
-        return _NoOpStatsClient()
-
-    try:
-        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
-    except Exception:
-        return _NoOpStatsClient()
-
-# ============================================
-# LOGGING
-# ============================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format=json.dumps({
-        'timestamp': '%(asctime)s',
-        'level': '%(levelname)s',
-        'service': 'data-generator',
-        'message': '%(message)s'
-    })
-)
-logger = logging.getLogger(__name__)
-
-# ============================================
-# OBSERVABILIDAD
-# ============================================
-
-meter, tracer, _ = configure_observability("data-generator")
-
-# StatsD para métricas
-statsd_client = _build_statsd_client('generator')
-
-# ============================================
-# MÉTRICAS
-# ============================================
-
-events_produced = meter.create_counter(
-    name="events_produced",
-    description="Total events produced",
-    unit="1"
-)
-
-events_failed = meter.create_counter(
-    name="events_failed",
-    description="Total events failed",
-    unit="1"
-)
-
-production_latency = meter.create_histogram(
-    name="production_latency_ms",
-    description="Event production latency",
-    unit="ms"
-)
-
-traffic_vehicle_volume = meter.create_counter(
-    name="movilidad.vehiculos_por_minuto",
-    description="Vehicles observed per minute",
-    unit="1"
-)
-
-traffic_vehicle_by_avenue = meter.create_counter(
-    name="movilidad.vehiculos_por_avenida",
-    description="Vehicles observed by avenue",
-    unit="1"
-)
-
-traffic_vehicle_by_district = meter.create_counter(
-    name="movilidad.vehiculos_por_comuna",
-    description="Vehicles observed by district",
-    unit="1"
-)
-
-# ============================================
-# CONFIGURACIÓN
-# ============================================
-
-KAFKA_BOOTSTRAP_SERVERS = 'kafka:29092'
-KAFKA_TOPIC = 'raw_events'
-NUM_SENSORS = 100
-BATCH_SIZE = 50
-INTERVAL_SECONDS = 2
-
-SENSOR_TYPES = ['traffic', 'air_quality', 'noise', 'weather', 'incident']
-LIGHT_STATUS = ['green', 'red', 'yellow']
-INCIDENT_TYPES = ['accident', 'congestion', 'breakdown', 'road_closure', 'none']
-LOCATIONS = [
-    {"intersection": "INT_001", "avenue": "Alameda", "district": "Santiago Centro", "latitude": -33.4378, "longitude": -70.6504},
-    {"intersection": "INT_002", "avenue": "Alameda", "district": "Estación Central", "latitude": -33.4517, "longitude": -70.6765},
-    {"intersection": "INT_003", "avenue": "Av. Providencia", "district": "Providencia", "latitude": -33.4372, "longitude": -70.6303},
-    {"intersection": "INT_004", "avenue": "Av. Apoquindo", "district": "Las Condes", "latitude": -33.4218, "longitude": -70.6067},
-    {"intersection": "INT_005", "avenue": "Av. Vitacura", "district": "Vitacura", "latitude": -33.3938, "longitude": -70.5885},
-    {"intersection": "INT_006", "avenue": "Av. 10 de Julio", "district": "Lo Prado", "latitude": -33.4399, "longitude": -70.7151},
-    {"intersection": "INT_007", "avenue": "Av. Recoleta", "district": "Recoleta", "latitude": -33.4210, "longitude": -70.6508},
-    {"intersection": "INT_008", "avenue": "Av. Matta", "district": "Estación Central", "latitude": -33.4479, "longitude": -70.6753},
-    {"intersection": "INT_009", "avenue": "Av. España", "district": "Santiago Centro", "latitude": -33.4410, "longitude": -70.6542},
-    {"intersection": "INT_010", "avenue": "Av. Libertador B. O'Higgins", "district": "Santiago Centro", "latitude": -33.4480, "longitude": -70.6634},
-    {"intersection": "INT_011", "avenue": "Av. Grecia", "district": "Ñuñoa", "latitude": -33.4591, "longitude": -70.6138},
-    {"intersection": "INT_012", "avenue": "Av. Irarrázaval", "district": "Ñuñoa", "latitude": -33.4557, "longitude": -70.6121},
-    {"intersection": "INT_013", "avenue": "Av. San Diego", "district": "Santiago Centro", "latitude": -33.4447, "longitude": -70.6510},
-    {"intersection": "INT_014", "avenue": "Av. Santa Rosa", "district": "Las Condes", "latitude": -33.4130, "longitude": -70.5780},
-    {"intersection": "INT_015", "avenue": "Av. Grecia", "district": "Providencia", "latitude": -33.4310, "longitude": -70.6205},
-    {"intersection": "INT_016", "avenue": "Av. Ejército", "district": "Santiago Centro", "latitude": -33.4302, "longitude": -70.6507},
-    {"intersection": "INT_017", "avenue": "Av. Pajaritos", "district": "Lo Espejo", "latitude": -33.5275, "longitude": -70.6965},
-    {"intersection": "INT_018", "avenue": "Av. Vicuña Mackenna", "district": "Macul", "latitude": -33.4920, "longitude": -70.6196},
-    {"intersection": "INT_019", "avenue": "Av. Principal", "district": "La Cisterna", "latitude": -33.5401, "longitude": -70.6649},
-    {"intersection": "INT_020", "avenue": "Av. Circunvalación", "district": "San Miguel", "latitude": -33.4932, "longitude": -70.6498},
-]
-
-# ============================================
-# GENERADOR DE EVENTOS
-# ============================================
-
-class EventGenerator:
-    def __init__(self):
-        self.producer = None
-        self.sensor_ids = [f"SENSOR_{i:04d}" for i in range(1, NUM_SENSORS + 1)]
-
-    def ensure_topic(self):
-        """Crear o recrear el topic de Kafka para evitar mensajes antiguos con codec incompatibles."""
-        try:
-            admin_client = KafkaAdminClient(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS], client_id='generator-admin')
-            topics = admin_client.list_topics()
-            if KAFKA_TOPIC in topics:
-                admin_client.delete_topics([KAFKA_TOPIC], timeout_ms=10000)
-                time.sleep(2)
-            admin_client.create_topics([NewTopic(name=KAFKA_TOPIC, num_partitions=1, replication_factor=1)], timeout_ms=10000)
-            admin_client.close()
-            logger.info(f"Ensured Kafka topic {KAFKA_TOPIC} exists")
-        except Exception as exc:
-            logger.warning(f"Topic bootstrap skipped: {exc}")
-
-    def connect_kafka(self):
-        """Conectar a Kafka"""
-        with tracer.start_as_current_span("kafka_connection"):
-            retry_count = 0
-            max_retries = 5
-            while retry_count < max_retries:
-                try:
-                    self.ensure_topic()
-                    self.producer = KafkaProducer(
-                        bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
-                        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-                        acks='all',
-                        request_timeout_ms=30000,
-                        retries=3
-                    )
-                    logger.info(f"Connected to Kafka at {KAFKA_BOOTSTRAP_SERVERS}")
-                    statsd_client.gauge('kafka_connection_attempts', retry_count)
-                    return True
-                except Exception as e:
-                    retry_count += 1
-                    logger.warning(f"Kafka connection attempt {retry_count}/{max_retries} failed: {str(e)}")
-                    if retry_count < max_retries:
-                        time.sleep(5)
-                    else:
-                        logger.error(f"Failed to connect to Kafka after {max_retries} attempts")
-                        return False
-
-    def _emit_traffic_metrics(self, event: Dict[str, Any]):
-        """Emitir métricas de movilidad a OTel y DogStatsD."""
-        vehicle_count = int(event.get('vehicle_count', 0) or 0)
-        avenue = event.get('avenue', 'unknown')
-        district = event.get('district', 'unknown')
-
-        traffic_vehicle_volume.add(vehicle_count)
-        traffic_vehicle_by_avenue.add(vehicle_count, attributes={'avenue': avenue})
-        traffic_vehicle_by_district.add(vehicle_count, attributes={'district': district})
-
-        try:
-            statsd_client.increment('movilidad.vehiculos_por_minuto', value=vehicle_count)
-            statsd_client.increment(
-                'movilidad.vehiculos_por_avenida',
-                value=vehicle_count,
-                tags=[f'avenue:{avenue}']
-            )
-            statsd_client.increment(
-                'movilidad.vehiculos_por_comuna',
-                value=vehicle_count,
-                tags=[f'district:{district}']
-            )
-        except TypeError:
-            statsd_client.increment('movilidad.vehiculos_por_avenida', value=vehicle_count)
-            statsd_client.increment('movilidad.vehiculos_por_comuna', value=vehicle_count)
-
-    def generate_event(self, sensor_id: str) -> Dict[str, Any]:
-        """Generar un evento simulado de sensor con ubicación realista."""
-        sensor_type = random.choice(SENSOR_TYPES)
-        location = random.choice(LOCATIONS)
-
-        event = {
-            'sensor_id': sensor_id,
-            'sensor_type': sensor_type,
-            'intersection': location['intersection'],
-            'avenue': location['avenue'],
-            'district': location['district'],
-            'latitude': round(location['latitude'], 6),
-            'longitude': round(location['longitude'], 6),
-            'vehicle_count': max(0, int(np.random.poisson(25))),
-            'average_speed': round(np.random.normal(40, 15), 2),
-            'traffic_density': round(random.uniform(0, 100), 2),
-            'traffic_light_status': random.choice(LIGHT_STATUS),
-            'air_quality_index': round(random.uniform(0, 500), 2),
-            'noise_level': round(random.uniform(40, 100), 2),
-            'incident_detected': random.choice([True, False]),
-            'incident_type': random.choice(INCIDENT_TYPES) if random.random() > 0.8 else 'none',
-            'temperature': round(random.uniform(15, 35), 2),
-            'humidity': round(random.uniform(30, 90), 2),
-            'timestamp': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
-        }
-
-        return event
-
-    def produce_events(self):
-        """Producir eventos continuamente"""
-        if not self.connect_kafka():
-            logger.error("Failed to connect to Kafka")
-            return
-
-        logger.info(f"Starting to produce events from {NUM_SENSORS} sensors")
-        logger.info(f"Batch size: {BATCH_SIZE}, Interval: {INTERVAL_SECONDS}s")
-
-        try:
-            while True:
-                with tracer.start_as_current_span("batch_production"):
-                    batch = []
-                    for _ in range(BATCH_SIZE):
-                        sensor_id = random.choice(self.sensor_ids)
-                        event = self.generate_event(sensor_id)
-                        batch.append(event)
-
-                    start_time = time.time()
-                    
-                    for event in batch:
-                        try:
-                            with tracer.start_as_current_span("send_event"):
-                                future = self.producer.send(
-                                    KAFKA_TOPIC,
-                                    value=event
-                                )
-                                # Esperar confirmación (bloqueante, pero necesario para garantía)
-                                future.get(timeout=5)
-                                
-                                events_produced.add(1)
-                                statsd_client.increment('events.produced')
-                                self._emit_traffic_metrics(event)
-                                
-                        except Exception as e:
-                            logger.error(f"Error sending event: {str(e)}")
-                            events_failed.add(1)
-                            statsd_client.increment('events.failed')
-
-                    elapsed = (time.time() - start_time) * 1000
-                    production_latency.record(elapsed)
-                    statsd_client.histogram('batch.latency_ms', elapsed)
-                    statsd_client.gauge('batch.size', BATCH_SIZE)
-
-                    logger.info(
-                        f"Batch produced: {BATCH_SIZE} events in {elapsed:.2f}ms"
-                    )
-
-                    time.sleep(INTERVAL_SECONDS)
-
-        except KeyboardInterrupt:
-            logger.info("Generator stopped by user")
-        except Exception as e:
-            logger.error(f"Critical error in producer: {str(e)}")
-        finally:
-            if self.producer:
-                self.producer.flush()
-                self.producer.close()
-            logger.info("Kafka connection closed")
-
-# ============================================
-# MAIN
-# ============================================
-
-if __name__ == "__main__":
-    generator = EventGenerator()
-    generator.produce_events()
-</file>
-
 <file path="generator/otel_setup.py">
 import logging
 import os
@@ -6135,6 +6586,376 @@ opentelemetry-instrumentation==0.52b0
 python-statsd==2.1.0
 </file>
 
+<file path="etl/requirements_gold.txt">
+boto3==1.28.0
+pyarrow==16.0.0
+pandas==2.2.3
+numpy==2.1.3
+opentelemetry-api==1.31.0
+opentelemetry-sdk==1.31.0
+opentelemetry-exporter-otlp-proto-http==1.31.0
+opentelemetry-instrumentation==0.52b0
+python-statsd==2.1.0
+</file>
+
+<file path="generator/generator.py">
+import json
+import logging
+import random
+import time
+from datetime import datetime, timedelta
+from typing import Dict, Any
+
+import numpy as np
+from kafka import KafkaProducer
+from kafka.admin import KafkaAdminClient, NewTopic
+from opentelemetry import metrics, trace
+
+try:
+    from statsd import StatsClient as _StatsClient
+except Exception:
+    try:
+        from statsd.client import StatsClient as _StatsClient
+    except Exception:
+        _StatsClient = None
+
+from otel_setup import configure_observability
+
+
+class _NoOpStatsClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def increment(self, *args, **kwargs):
+        return None
+
+    def gauge(self, *args, **kwargs):
+        return None
+
+    def histogram(self, *args, **kwargs):
+        return None
+
+
+def _build_statsd_client(prefix: str):
+    if _StatsClient is None:
+        return _NoOpStatsClient()
+
+    try:
+        return _StatsClient(host='datadog-agent', port=8125, prefix=prefix)
+    except Exception:
+        return _NoOpStatsClient()
+
+# ============================================
+# LOGGING
+# ============================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format=json.dumps({
+        'timestamp': '%(asctime)s',
+        'level': '%(levelname)s',
+        'service': 'data-generator',
+        'message': '%(message)s'
+    })
+)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# OBSERVABILIDAD
+# ============================================
+
+meter, tracer, _ = configure_observability("data-generator")
+
+# StatsD para métricas
+statsd_client = _build_statsd_client('generator')
+
+# ============================================
+# MÉTRICAS
+# ============================================
+
+events_produced = meter.create_counter(
+    name="events_produced",
+    description="Total events produced",
+    unit="1"
+)
+
+events_failed = meter.create_counter(
+    name="events_failed",
+    description="Total events failed",
+    unit="1"
+)
+
+production_latency = meter.create_histogram(
+    name="production_latency_ms",
+    description="Event production latency",
+    unit="ms"
+)
+
+traffic_vehicle_volume = meter.create_counter(
+    name="movilidad.vehiculos_por_minuto",
+    description="Vehicles observed per minute",
+    unit="1"
+)
+
+traffic_vehicle_by_avenue = meter.create_counter(
+    name="movilidad.vehiculos_por_avenida",
+    description="Vehicles observed by avenue",
+    unit="1"
+)
+
+traffic_vehicle_by_district = meter.create_counter(
+    name="movilidad.vehiculos_por_comuna",
+    description="Vehicles observed by district",
+    unit="1"
+)
+
+accidents_by_district = meter.create_counter(
+    name="movilidad.accidentes_por_comuna",
+    description="Accident incidents by district",
+    unit="1"
+)
+
+recovery_time = meter.create_histogram(
+    name="service.recovery_time_ms",
+    description="Time to recover service after a connection failure",
+    unit="ms"
+)
+
+# ============================================
+# CONFIGURACIÓN
+# ============================================
+
+KAFKA_BOOTSTRAP_SERVERS = 'kafka:29092'
+KAFKA_TOPIC = 'raw_events'
+NUM_SENSORS = 100
+BATCH_SIZE = 50
+INTERVAL_SECONDS = 2
+
+SENSOR_TYPES = ['traffic', 'air_quality', 'noise', 'weather', 'incident']
+LIGHT_STATUS = ['green', 'red', 'yellow']
+INCIDENT_TYPES = ['accident', 'congestion', 'breakdown', 'road_closure', 'none']
+LOCATIONS = [
+    {"intersection": "INT_001", "avenue": "Alameda", "district": "Santiago Centro", "latitude": -33.4378, "longitude": -70.6504},
+    {"intersection": "INT_002", "avenue": "Alameda", "district": "Estación Central", "latitude": -33.4517, "longitude": -70.6765},
+    {"intersection": "INT_003", "avenue": "Av. Providencia", "district": "Providencia", "latitude": -33.4372, "longitude": -70.6303},
+    {"intersection": "INT_004", "avenue": "Av. Apoquindo", "district": "Las Condes", "latitude": -33.4218, "longitude": -70.6067},
+    {"intersection": "INT_005", "avenue": "Av. Vitacura", "district": "Vitacura", "latitude": -33.3938, "longitude": -70.5885},
+    {"intersection": "INT_006", "avenue": "Av. 10 de Julio", "district": "Lo Prado", "latitude": -33.4399, "longitude": -70.7151},
+    {"intersection": "INT_007", "avenue": "Av. Recoleta", "district": "Recoleta", "latitude": -33.4210, "longitude": -70.6508},
+    {"intersection": "INT_008", "avenue": "Av. Matta", "district": "Estación Central", "latitude": -33.4479, "longitude": -70.6753},
+    {"intersection": "INT_009", "avenue": "Av. España", "district": "Santiago Centro", "latitude": -33.4410, "longitude": -70.6542},
+    {"intersection": "INT_010", "avenue": "Av. Libertador B. O'Higgins", "district": "Santiago Centro", "latitude": -33.4480, "longitude": -70.6634},
+    {"intersection": "INT_011", "avenue": "Av. Grecia", "district": "Ñuñoa", "latitude": -33.4591, "longitude": -70.6138},
+    {"intersection": "INT_012", "avenue": "Av. Irarrázaval", "district": "Ñuñoa", "latitude": -33.4557, "longitude": -70.6121},
+    {"intersection": "INT_013", "avenue": "Av. San Diego", "district": "Santiago Centro", "latitude": -33.4447, "longitude": -70.6510},
+    {"intersection": "INT_014", "avenue": "Av. Santa Rosa", "district": "Las Condes", "latitude": -33.4130, "longitude": -70.5780},
+    {"intersection": "INT_015", "avenue": "Av. Grecia", "district": "Providencia", "latitude": -33.4310, "longitude": -70.6205},
+    {"intersection": "INT_016", "avenue": "Av. Ejército", "district": "Santiago Centro", "latitude": -33.4302, "longitude": -70.6507},
+    {"intersection": "INT_017", "avenue": "Av. Pajaritos", "district": "Lo Espejo", "latitude": -33.5275, "longitude": -70.6965},
+    {"intersection": "INT_018", "avenue": "Av. Vicuña Mackenna", "district": "Macul", "latitude": -33.4920, "longitude": -70.6196},
+    {"intersection": "INT_019", "avenue": "Av. Principal", "district": "La Cisterna", "latitude": -33.5401, "longitude": -70.6649},
+    {"intersection": "INT_020", "avenue": "Av. Circunvalación", "district": "San Miguel", "latitude": -33.4932, "longitude": -70.6498},
+]
+
+# ============================================
+# GENERADOR DE EVENTOS
+# ============================================
+
+class EventGenerator:
+    def __init__(self):
+        self.producer = None
+        self.sensor_ids = [f"SENSOR_{i:04d}" for i in range(1, NUM_SENSORS + 1)]
+        self.failure_start_time = None
+
+    def ensure_topic(self):
+        """Crear o recrear el topic de Kafka para evitar mensajes antiguos con codec incompatibles."""
+        try:
+            admin_client = KafkaAdminClient(bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS], client_id='generator-admin')
+            topics = admin_client.list_topics()
+            if KAFKA_TOPIC in topics:
+                admin_client.delete_topics([KAFKA_TOPIC], timeout_ms=10000)
+                time.sleep(2)
+            admin_client.create_topics([NewTopic(name=KAFKA_TOPIC, num_partitions=1, replication_factor=1)], timeout_ms=10000)
+            admin_client.close()
+            logger.info(f"Ensured Kafka topic {KAFKA_TOPIC} exists")
+        except Exception as exc:
+            logger.warning(f"Topic bootstrap skipped: {exc}")
+
+    def connect_kafka(self):
+        """Conectar a Kafka"""
+        with tracer.start_as_current_span("kafka_connection"):
+            retry_count = 0
+            max_retries = 5
+
+            if self.failure_start_time is None:
+                self.failure_start_time = time.time()
+
+            while retry_count < max_retries:
+                try:
+                    self.ensure_topic()
+                    self.producer = KafkaProducer(
+                        bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
+                        value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                        acks='all',
+                        request_timeout_ms=30000,
+                        retries=3
+                    )
+                    logger.info(f"Connected to Kafka at {KAFKA_BOOTSTRAP_SERVERS}")
+                    statsd_client.gauge('kafka_connection_attempts', retry_count)
+
+                    if self.failure_start_time is not None:
+                        recovery_ms = (time.time() - self.failure_start_time) * 1000
+                        recovery_time.record(recovery_ms, attributes={'service': 'generator'})
+                        try:
+                            statsd_client.histogram('service.recovery_time_ms', recovery_ms, tags=['service:generator'])
+                        except TypeError:
+                            statsd_client.histogram('service.recovery_time_ms', recovery_ms)
+                        self.failure_start_time = None
+                        logger.info(f"Service recovered after {recovery_ms:.2f} ms")
+
+                    return True
+                except Exception as e:
+                    retry_count += 1
+                    logger.warning(f"Kafka connection attempt {retry_count}/{max_retries} failed: {str(e)}")
+                    if retry_count < max_retries:
+                        time.sleep(5)
+                    else:
+                        logger.error(f"Failed to connect to Kafka after {max_retries} attempts")
+                        return False
+
+    def _emit_traffic_metrics(self, event: Dict[str, Any]):
+        """Emitir métricas de movilidad a OTel y DogStatsD."""
+        vehicle_count = int(event.get('vehicle_count', 0) or 0)
+        avenue = event.get('avenue', 'unknown')
+        district = event.get('district', 'unknown')
+
+        traffic_vehicle_volume.add(vehicle_count)
+        traffic_vehicle_by_avenue.add(vehicle_count, attributes={'avenue': avenue})
+        traffic_vehicle_by_district.add(vehicle_count, attributes={'district': district})
+
+        try:
+            statsd_client.increment('movilidad.vehiculos_por_minuto', value=vehicle_count)
+            statsd_client.increment(
+                'movilidad.vehiculos_por_avenida',
+                value=vehicle_count,
+                tags=[f'avenue:{avenue}']
+            )
+            statsd_client.increment(
+                'movilidad.vehiculos_por_comuna',
+                value=vehicle_count,
+                tags=[f'district:{district}']
+            )
+        except TypeError:
+            statsd_client.increment('movilidad.vehiculos_por_avenida', value=vehicle_count)
+            statsd_client.increment('movilidad.vehiculos_por_comuna', value=vehicle_count)
+
+    def generate_event(self, sensor_id: str) -> Dict[str, Any]:
+        """Generar un evento simulado de sensor con ubicación realista."""
+        sensor_type = random.choice(SENSOR_TYPES)
+        location = random.choice(LOCATIONS)
+
+        event = {
+            'sensor_id': sensor_id,
+            'sensor_type': sensor_type,
+            'intersection': location['intersection'],
+            'avenue': location['avenue'],
+            'district': location['district'],
+            'latitude': round(location['latitude'], 6),
+            'longitude': round(location['longitude'], 6),
+            'vehicle_count': max(0, int(np.random.poisson(25))),
+            'average_speed': round(np.random.normal(40, 15), 2),
+            'traffic_density': round(random.uniform(0, 100), 2),
+            'traffic_light_status': random.choice(LIGHT_STATUS),
+            'air_quality_index': round(random.uniform(0, 500), 2),
+            'noise_level': round(random.uniform(40, 100), 2),
+            'incident_detected': random.choice([True, False]),
+            'incident_type': random.choice(INCIDENT_TYPES) if random.random() > 0.8 else 'none',
+            'temperature': round(random.uniform(15, 35), 2),
+            'humidity': round(random.uniform(30, 90), 2),
+            'timestamp': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        }
+
+        return event
+
+    def produce_events(self):
+        """Producir eventos continuamente"""
+        if not self.connect_kafka():
+            logger.error("Failed to connect to Kafka")
+            return
+
+        logger.info(f"Starting to produce events from {NUM_SENSORS} sensors")
+        logger.info(f"Batch size: {BATCH_SIZE}, Interval: {INTERVAL_SECONDS}s")
+
+        try:
+            while True:
+                with tracer.start_as_current_span("batch_production"):
+                    batch = []
+                    for _ in range(BATCH_SIZE):
+                        sensor_id = random.choice(self.sensor_ids)
+                        event = self.generate_event(sensor_id)
+                        batch.append(event)
+
+                    start_time = time.time()
+                    
+                    for event in batch:
+                        try:
+                            with tracer.start_as_current_span("send_event"):
+                                future = self.producer.send(
+                                    KAFKA_TOPIC,
+                                    value=event
+                                )
+                                # Esperar confirmación (bloqueante, pero necesario para garantía)
+                                future.get(timeout=5)
+                                
+                                events_produced.add(1)
+                                statsd_client.increment('events.produced')
+                                self._emit_traffic_metrics(event)
+
+                                # --- NEW: accidentes_por_comuna ---
+                                incident_type = event.get('incident_type', 'none')
+                                if incident_type == 'accident':
+                                    district = event.get('district', 'unknown')
+                                    accidents_by_district.add(1, attributes={'district': district})
+                                    try:
+                                        statsd_client.increment('movilidad.accidentes_por_comuna', tags=[f'district:{district}'])
+                                    except TypeError:
+                                        statsd_client.increment('movilidad.accidentes_por_comuna')
+                                
+                        except Exception as e:
+                            logger.error(f"Error sending event: {str(e)}")
+                            events_failed.add(1)
+                            statsd_client.increment('events.failed')
+
+                    elapsed = (time.time() - start_time) * 1000
+                    production_latency.record(elapsed)
+                    statsd_client.histogram('batch.latency_ms', elapsed)
+                    statsd_client.gauge('batch.size', BATCH_SIZE)
+
+                    logger.info(
+                        f"Batch produced: {BATCH_SIZE} events in {elapsed:.2f}ms"
+                    )
+
+                    time.sleep(INTERVAL_SECONDS)
+
+        except KeyboardInterrupt:
+            logger.info("Generator stopped by user")
+        except Exception as e:
+            logger.error(f"Critical error in producer: {str(e)}")
+        finally:
+            if self.producer:
+                self.producer.flush()
+                self.producer.close()
+            logger.info("Kafka connection closed")
+
+# ============================================
+# MAIN
+# ============================================
+
+if __name__ == "__main__":
+    generator = EventGenerator()
+    generator.produce_events()
+</file>
+
 <file path="streaming_worker/worker.py">
 import json
 import logging
@@ -6228,6 +7049,24 @@ processing_latency = meter.create_histogram(
     unit="ms"
 )
 
+pipeline_success_rate = meter.create_gauge(
+    name="pipeline.success_rate_pct",
+    description="Percentage of events successfully processed per batch",
+    unit="%"
+)
+
+pipeline_throughput = meter.create_gauge(
+    name="pipeline.throughput.events_per_min",
+    description="Processing throughput normalized to events per minute",
+    unit="events/min"
+)
+
+recovery_time = meter.create_histogram(
+    name="service.recovery_time_ms",
+    description="Time to recover service after a connection failure",
+    unit="ms"
+)
+
 # ============================================
 # CONFIGURACIÓN
 # ============================================
@@ -6297,6 +7136,7 @@ class StreamingWorker:
     def __init__(self):
         self.consumer: Optional[KafkaConsumer] = None
         self.minio_client = MinIOClient()
+        self.failure_start_time: Optional[float] = None
 
     def ensure_topic(self):
         """Asegurar que el topic exista y esté limpio para la ingesta de Bronze."""
@@ -6317,6 +7157,9 @@ class StreamingWorker:
         retry_count = 0
         max_retries = 5
         
+        if self.failure_start_time is None:
+            self.failure_start_time = time.time()
+
         while retry_count < max_retries:
             try:
                 self.ensure_topic()
@@ -6333,6 +7176,17 @@ class StreamingWorker:
                 )
                 logger.info(f"Connected to Kafka topic {KAFKA_TOPIC}")
                 statsd_client.gauge('kafka_connection_attempts', retry_count)
+
+                if self.failure_start_time is not None:
+                    recovery_ms = (time.time() - self.failure_start_time) * 1000
+                    recovery_time.record(recovery_ms, attributes={'service': 'streaming_worker'})
+                    try:
+                        statsd_client.histogram('service.recovery_time_ms', recovery_ms, tags=['service:streaming_worker'])
+                    except TypeError:
+                        statsd_client.histogram('service.recovery_time_ms', recovery_ms)
+                    self.failure_start_time = None
+                    logger.info(f"Service recovered after {recovery_ms:.2f} ms")
+
                 return True
             except Exception as e:
                 retry_count += 1
@@ -6355,14 +7209,19 @@ class StreamingWorker:
         try:
             while True:
                 with tracer.start_as_current_span("consume_batch"):
+                    batch_start_time = time.time()
                     messages = self.consumer.poll(timeout_ms=1000, max_records=100)
                     
                     if not messages:
                         continue
 
+                    total_in_batch = 0
+                    store_failed = 0
+
                     for topic_partition, records in messages.items():
                         with tracer.start_as_current_span("process_partition"):
                             for record in records:
+                                total_in_batch += 1
                                 start_time = time.time()
                                 
                                 try:
@@ -6372,6 +7231,8 @@ class StreamingWorker:
                                     if self.minio_client.store_event(event, timestamp):
                                         messages_consumed.add(1)
                                         statsd_client.increment('messages.consumed')
+                                    else:
+                                        store_failed += 1
                                     
                                     elapsed = (time.time() - start_time) * 1000
                                     processing_latency.record(elapsed)
@@ -6379,6 +7240,26 @@ class StreamingWorker:
                                 except Exception as e:
                                     logger.error(f"Error processing message: {str(e)}")
                                     statsd_client.increment('messages.processing_failed')
+                                    store_failed += 1
+
+                    # --- NEW: success rate % ---
+                    if total_in_batch > 0:
+                        success_pct = ((total_in_batch - store_failed) / total_in_batch) * 100
+                        pipeline_success_rate.set(success_pct)
+                        try:
+                            statsd_client.gauge('messages.success_rate_pct', success_pct)
+                        except Exception:
+                            pass
+
+                    # --- NEW: throughput events/min ---
+                    batch_elapsed_seconds = time.time() - batch_start_time
+                    if batch_elapsed_seconds > 0:
+                        throughput_val = (total_in_batch / batch_elapsed_seconds) * 60
+                        pipeline_throughput.set(throughput_val)
+                        try:
+                            statsd_client.gauge('pipeline.throughput.events_per_min', throughput_val)
+                        except Exception:
+                            pass
 
                     batch_count += 1
                     if batch_count % 10 == 0:
@@ -6497,6 +7378,18 @@ etl_duration = meter.create_histogram(
     name="etl_duration_seconds",
     description="ETL execution duration",
     unit="s"
+)
+
+pipeline_success_rate = meter.create_gauge(
+    name="pipeline.success_rate_pct",
+    description="Percentage of clean records after validation vs total loaded from bronze",
+    unit="%"
+)
+
+pipeline_throughput = meter.create_gauge(
+    name="pipeline.throughput.events_per_min",
+    description="Silver layer throughput normalized to events per minute",
+    unit="events/min"
 )
 
 # ============================================
@@ -6688,9 +7581,17 @@ class SparkETL:
                 if df is None:
                     logger.warning("No data to process")
                     return
+
+                total_loaded = df.count()
                 
                 # Validar y limpiar
                 df = self.validate_and_clean(df)
+                records_after_validation = df.count()
+
+                invalid_count = total_loaded - records_after_validation
+                if invalid_count > 0:
+                    records_invalid.add(invalid_count)
+                    statsd_client.increment('records.invalid', invalid_count)
                 
                 # Enriquecer
                 df = self.enrich_data(df)
@@ -6701,6 +7602,24 @@ class SparkETL:
                 elapsed = time.time() - start_time
                 etl_duration.record(elapsed)
                 statsd_client.histogram('etl.duration_seconds', elapsed)
+
+                # --- NEW: success rate % ---
+                if total_loaded > 0:
+                    success_pct = (records_after_validation / total_loaded) * 100
+                    pipeline_success_rate.set(success_pct)
+                    try:
+                        statsd_client.gauge('pipeline.success_rate_pct', success_pct)
+                    except Exception:
+                        pass
+
+                # --- NEW: throughput events/min ---
+                if elapsed > 0:
+                    throughput_val = (records_after_validation / elapsed) * 60
+                    pipeline_throughput.set(throughput_val)
+                    try:
+                        statsd_client.gauge('pipeline.throughput.events_per_min', throughput_val)
+                    except Exception:
+                        pass
                 
                 logger.info(f"ETL completed in {elapsed:.2f} seconds")
                 
@@ -6818,6 +7737,18 @@ transformation_duration = meter.create_histogram(
     name="transformation_duration_seconds",
     description="Transformation duration",
     unit="s"
+)
+
+alert_generation_latency = meter.create_histogram(
+    name="alert_generation_latency_ms",
+    description="Time to generate incident reports and write to Gold",
+    unit="ms"
+)
+
+accidents_by_district = meter.create_counter(
+    name="movilidad.accidentes_por_comuna",
+    description="Accident incidents by district",
+    unit="1"
 )
 
 # ============================================
@@ -7079,20 +8010,33 @@ class GoldTransformer:
         """Generar reportes de incidentes"""
         incidents = [r for r in records if r.get('incident_detected', False)]
 
-        return [
-            {
+        reports = []
+        for r in incidents:
+            incident_type = r.get('incident_type', 'unknown')
+            district = r.get('district', 'unknown')
+
+            # --- NEW: accidentes_por_comuna ---
+            if incident_type == 'accident':
+                accidents_by_district.add(1, attributes={'district': district})
+                try:
+                    statsd_client.increment('movilidad.accidentes_por_comuna', tags=[f'district:{district}'])
+                except TypeError:
+                    statsd_client.increment('movilidad.accidentes_por_comuna')
+
+            reports.append({
                 'timestamp': r.get('timestamp').isoformat() if hasattr(r.get('timestamp'), 'isoformat') else r.get('timestamp'),
                 'sensor_id': r.get('sensor_id'),
                 'sensor_type': r.get('sensor_type'),
-                'incident_type': r.get('incident_type'),
+                'incident_type': incident_type,
+                'district': district,
                 'location': {
                     'latitude': r.get('latitude'),
                     'longitude': r.get('longitude')
                 },
                 'intersection': r.get('intersection')
-            }
-            for r in incidents
-        ]
+            })
+
+        return reports
 
     def transform_and_load(self):
         """Transformar datos de Silver a Gold y almacenar en MinIO"""
@@ -7143,7 +8087,8 @@ class GoldTransformer:
                         logger.info(f"Wrote traffic aggregates to gold/{key}")
                         statsd_client.increment('documents.inserted', 1)
 
-                # 4. Generar reportes de incidentes
+                # 4. Generar reportes de incidentes (con medición de latencia)
+                alert_start_time = time.time()
                 incident_reports = self.generate_incident_reports(silver_records)
                 if incident_reports:
                     key = f"incident_reports/date={date_str}/{int(time.time() * 1000)}.json"
@@ -7151,6 +8096,12 @@ class GoldTransformer:
                         documents_created.add(len(incident_reports))
                         logger.info(f"Wrote {len(incident_reports)} incident reports to gold/{key}")
                         statsd_client.increment('documents.inserted', len(incident_reports))
+                alert_elapsed_ms = (time.time() - alert_start_time) * 1000
+                alert_generation_latency.record(alert_elapsed_ms)
+                try:
+                    statsd_client.histogram('alert_generation_latency_ms', alert_elapsed_ms)
+                except Exception:
+                    pass
 
                 elapsed = time.time() - start_time
                 transformation_duration.record(elapsed)
@@ -7210,18 +8161,6 @@ class GoldTransformer:
 if __name__ == "__main__":
     transformer = GoldTransformer()
     transformer.run_scheduler()
-</file>
-
-<file path="etl/requirements_gold.txt">
-boto3==1.28.0
-pyarrow==16.0.0
-pandas==2.2.3
-numpy==2.1.3
-opentelemetry-api==1.31.0
-opentelemetry-sdk==1.31.0
-opentelemetry-exporter-otlp-proto-http==1.31.0
-opentelemetry-instrumentation==0.52b0
-python-statsd==2.1.0
 </file>
 
 <file path="fastapi_service/main.py">
@@ -7308,6 +8247,12 @@ requests_total = meter.create_counter(
 request_duration = meter.create_histogram(
     name="request_duration_ms",
     description="Request duration",
+    unit="ms"
+)
+
+recovery_time = meter.create_histogram(
+    name="service.recovery_time_ms",
+    description="Time to recover service after a connection failure",
     unit="ms"
 )
 
@@ -7426,19 +8371,42 @@ app = FastAPI(
 
 # Variable global para el cliente MinIO
 minio_client: Optional[MinIOClient] = None
+failure_start_time: Optional[float] = None
 
 FastAPIInstrumentor.instrument_app(app)
 
 @app.on_event("startup")
 async def startup_event():
     """Inicializar conexión a MinIO"""
-    global minio_client
-    try:
-        minio_client = MinIOClient()
-        logger.info("API started successfully - connected to MinIO gold layer")
-    except Exception as e:
-        logger.error(f"Failed to initialize MinIO client: {str(e)}")
-        raise
+    global minio_client, failure_start_time
+    if failure_start_time is None:
+        failure_start_time = time.time()
+
+    retry_count = 0
+    max_retries = 5
+    while retry_count < max_retries:
+        try:
+            minio_client = MinIOClient()
+            logger.info("API started successfully - connected to MinIO gold layer")
+
+            if failure_start_time is not None:
+                recovery_ms = (time.time() - failure_start_time) * 1000
+                recovery_time.record(recovery_ms, attributes={'service': 'fastapi'})
+                try:
+                    statsd_client.histogram('service.recovery_time_ms', recovery_ms, tags=['service:fastapi'])
+                except TypeError:
+                    statsd_client.histogram('service.recovery_time_ms', recovery_ms)
+                failure_start_time = None
+                logger.info(f"FastAPI recovered after {recovery_ms:.2f} ms")
+            return
+
+        except Exception as e:
+            retry_count += 1
+            logger.warning(f"MinIO connection attempt {retry_count}/{max_retries} failed: {str(e)}")
+            if retry_count >= max_retries:
+                logger.error(f"Failed to initialize MinIO client after {max_retries} attempts")
+                raise
+            time.sleep(3)
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -7453,6 +8421,7 @@ async def shutdown_event():
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint"""
+    global failure_start_time
     start_time = time.time()
 
     try:
@@ -7460,7 +8429,19 @@ async def health_check():
             requests_total.add(1)
 
             if not minio_client.health_check():
+                if failure_start_time is None:
+                    failure_start_time = time.time()
                 raise HTTPException(status_code=503, detail="MinIO not available")
+
+            if failure_start_time is not None:
+                recovery_ms = (time.time() - failure_start_time) * 1000
+                recovery_time.record(recovery_ms, attributes={'service': 'fastapi'})
+                try:
+                    statsd_client.histogram('service.recovery_time_ms', recovery_ms, tags=['service:fastapi'])
+                except TypeError:
+                    statsd_client.histogram('service.recovery_time_ms', recovery_ms)
+                failure_start_time = None
+                logger.info(f"FastAPI recovered after {recovery_ms:.2f} ms")
 
             elapsed = (time.time() - start_time) * 1000
             request_duration.record(elapsed)
@@ -7471,6 +8452,8 @@ async def health_check():
                 "service": "data-platform-api"
             }
     except Exception as e:
+        if failure_start_time is None:
+            failure_start_time = time.time()
         logger.error(f"Health check failed: {str(e)}")
         raise HTTPException(status_code=503, detail="Service unavailable")
 
@@ -7546,7 +8529,7 @@ async def get_incidents(
     start_time = time.time()
 
     try:
-        with tracer.start_as_current_span("get_incidents"):
+        with tracer.start_as_current_span("api.get_incidents.query"):
             requests_total.add(1)
 
             # Leer todos los datos de incident_reports desde MinIO
@@ -7574,6 +8557,9 @@ async def get_incidents(
             elapsed = (time.time() - start_time) * 1000
             request_duration.record(elapsed)
             statsd_client.histogram('endpoint.incidents.duration_ms', elapsed)
+            statsd_client.histogram('api.incidents.query_latency_ms', elapsed)
+
+            statsd_client.gauge('api.incidents.query_count', len(results))
 
             return results
     except Exception as e:
